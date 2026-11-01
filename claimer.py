@@ -444,11 +444,19 @@ class TelegramNotifier:
             log.info("Telegram 通知已送出")
             return True
         except urllib.error.HTTPError as exc:
-            # HTTPError 的字串表示含完整 URL（內有 token），只記錄狀態碼
-            log.warning("Telegram 通知失敗：HTTP %s", exc.code)
+            # HTTPError 的字串表示含完整 URL（內有 token），只記錄狀態碼與 API 回傳的說明
+            log.warning("Telegram 通知失敗：HTTP %s %s", exc.code, telegram_error_description(exc))
         except Exception as exc:  # noqa: BLE001 - 通知為盡力而為
             log.warning("Telegram 通知失敗：%s", type(exc).__name__)
         return False
+
+
+def telegram_error_description(exc: urllib.error.HTTPError) -> str:
+    """取出 Telegram API 回應中的 description（例如 chat not found），不含 URL。"""
+    try:
+        return str(json.loads(exc.read().decode("utf-8")).get("description", ""))
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1120,10 +1128,13 @@ def main(argv: list[str] | None = None) -> int:
         settings = load_settings(config_path)
         setup_logging(settings.log_level, [settings.tg_bot_token])
         check_file_permissions(config_path, "設定檔")
-        if not args.dry_run:
+        configured = bool(settings.tg_bot_token and settings.tg_chat_id)
+        if args.dry_run:
             # dry-run 只做驗證，不發任何通知
+            log.info("Telegram 通知：%s（dry-run 不發送）", "已設定" if configured else "未設定")
+        else:
             notifier = TelegramNotifier(settings.tg_bot_token, settings.tg_chat_id)
-        log.info("Telegram 通知：%s", "啟用" if notifier.enabled else "未啟用")
+            log.info("Telegram 通知：%s", "啟用" if configured else "未設定")
         clients, _ = build_clients(settings)
         claimer = Claimer(settings, clients, notifier)
 

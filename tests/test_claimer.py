@@ -3,6 +3,7 @@
 執行：python -m unittest discover -s tests -v
 """
 
+import io
 import json
 import os
 import stat
@@ -463,6 +464,19 @@ class TestSecrets(unittest.TestCase):
              self.assertLogs("oci-a1-claimer", level="WARNING") as logs:
             self.assertFalse(n.send("hi"))
         self.assertNotIn(token, "\n".join(logs.output))
+
+    def test_telegram_error_shows_api_description(self):
+        token = "123456:SECRET-TOKEN"
+        n = claimer.TelegramNotifier(token, "42")
+        body = io.BytesIO(b'{"ok":false,"description":"Forbidden: bot was blocked by the user"}')
+        err = claimer.urllib.error.HTTPError(f"https://api.telegram.org/bot{token}/sendMessage",
+                                             403, "Forbidden", {}, body)
+        with mock.patch.object(claimer.urllib.request, "urlopen", side_effect=err), \
+             self.assertLogs("oci-a1-claimer", level="WARNING") as logs:
+            n.send("hi")
+        out = "\n".join(logs.output)
+        self.assertIn("bot was blocked", out)
+        self.assertNotIn(token, out)
 
 
 class TestUncertainLaunch(ClaimerTestBase):

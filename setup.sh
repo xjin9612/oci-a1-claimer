@@ -2,6 +2,7 @@
 # oci-a1-claimer 安裝腳本（Linux / macOS / WSL）
 #
 #   ./setup.sh                         本機安裝：建立 .venv、檢查 secrets/ 與 config.env、執行 dry-run
+#   ./setup.sh --telegram              設定 Telegram 通知：驗證 token、取得 chat id、發測試訊息、寫入 config.env
 #   sudo ./setup.sh --systemd          安裝成 systemd 服務（專用使用者、/opt、/etc、/var/lib）
 #   sudo ./setup.sh --systemd --update-config
 #                                      以專案內的 config.env 與 secrets/ 覆蓋已安裝的版本
@@ -30,7 +31,7 @@ info()  { printf '\033[32m[資訊]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[33m[警告]\033[0m %s\n' "$*" >&2; }
 die()   { printf '\033[31m[錯誤]\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # 讀取 KEY=VALUE 檔中最後一個 KEY 的值（去除前後引號）
 env_value() {
@@ -142,6 +143,78 @@ install_local() {
 }
 
 # ---------------------------------------------------------------------------
+# Telegram 通知設定
+# ---------------------------------------------------------------------------
+setup_telegram() {
+    cd "$PROJECT_DIR"
+    [[ -f config.env ]] || die "找不到 config.env，請先執行 ./setup.sh"
+    local py token script
+    py=$(find_python)
+
+    echo "1. 在 Telegram 搜尋 @BotFather（帳號名稱完全相符、有認證勾勾），傳 /newbot 建立 Bot。"
+    read -rsp "2. 貼上 BotFather 給的 token 後按 Enter（輸入不會顯示）：" token
+    echo
+    [[ -n "$token" ]] || die "沒有輸入 token"
+
+    # token 以環境變數傳給 Python，不出現在指令列參數與 shell 歷史中
+    script=$(cat <<'PY'
+import json, os, re, sys, urllib.error, urllib.parse, urllib.request
+from pathlib import Path
+
+token = os.environ["TG_TOKEN"].strip()
+config = Path(sys.argv[1])
+
+def api(method, **params):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params).encode() if params else None
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15) as r:
+            return json.load(r)["result"]
+    except urllib.error.HTTPError as e:
+        try:
+            desc = json.loads(e.read().decode()).get("description", "")
+        except Exception:
+            desc = ""
+        sys.exit(f"[錯誤] Telegram API {method} 失敗：HTTP {e.code} {desc}")
+    except urllib.error.URLError as e:
+        sys.exit(f"[錯誤] 無法連線到 Telegram：{e.reason}")
+
+me = api("getMe")
+print(f"[資訊] token 有效，Bot：@{me['username']}")
+with open("/dev/tty") as tty:
+    print(f"3. 在 Telegram 打開 @{me['username']}，按「開始」並傳一則訊息，完成後回到這裡按 Enter", end="", flush=True)
+    tty.readline()
+
+chats = [u["message"]["chat"] for u in api("getUpdates") if "message" in u]
+if not chats:
+    sys.exit("[錯誤] 沒有收到任何訊息：請確認已對 Bot 傳訊息，再重新執行 ./setup.sh --telegram")
+chat = chats[-1]
+name = chat.get("title") or " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")]))
+print(f"[資訊] chat id：{chat['id']}（{name}）")
+
+api("sendMessage", chat_id=chat["id"], text="oci-a1-claimer：Telegram 通知設定完成")
+print("[資訊] 已發送測試訊息，請確認 Telegram 有收到")
+
+text = config.read_text(encoding="utf-8")
+for key, value in (("TG_BOT_TOKEN", token), ("TG_CHAT_ID", str(chat["id"]))):
+    pattern = re.compile(rf"^[ \t]*#?[ \t]*{key}[ \t]*=.*$", re.M)
+    line = f"{key}={value}"
+    text, n = pattern.subn(lambda _m: line, text, count=1)
+    if not n:
+        text = text.rstrip("\n") + f"\n{line}\n"
+config.write_text(text, encoding="utf-8")
+print("[資訊] 已寫入 config.env 的 TG_BOT_TOKEN 與 TG_CHAT_ID")
+PY
+)
+    TG_TOKEN="$token" "$py" -c "$script" "$PROJECT_DIR/config.env"
+    chmod 600 config.env
+    info "重新啟動 claimer 後生效（前景執行：Ctrl+C 後重跑 .venv/bin/python claimer.py）"
+    if [[ -f "$ETC_DIR/config.env" ]]; then
+        info "已安裝 systemd 服務：執行 sudo ./setup.sh --systemd --update-config 套用到服務"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # systemd 安裝 / 移除
 # ---------------------------------------------------------------------------
 require_root_systemd() {
@@ -241,6 +314,7 @@ main() {
     while (($#)); do
         case $1 in
             --systemd) mode=systemd ;;
+            --telegram) mode=telegram ;;
             --uninstall) mode=uninstall ;;
             --update-config) update=1 ;;
             --purge) purge=1 ;;
@@ -251,6 +325,7 @@ main() {
     done
     case $mode in
         local) install_local ;;
+        telegram) setup_telegram ;;
         systemd) install_systemd "$update" ;;
         uninstall) uninstall_systemd "$purge" ;;
     esac
