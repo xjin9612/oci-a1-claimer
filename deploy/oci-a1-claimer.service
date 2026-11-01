@@ -1,0 +1,59 @@
+# oci-a1-claimer 的 systemd unit
+# 安裝步驟見 README「以 systemd 長期執行」。
+[Unit]
+Description=oci-a1-claimer - 申請 OCI Always Free A1.Flex 實例
+Wants=network-online.target
+After=network-online.target
+# 非預期錯誤（exit 1）時的重啟上限：1 小時內最多 10 次
+StartLimitIntervalSec=1h
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=oci-claimer
+Group=oci-claimer
+WorkingDirectory=/opt/oci-a1-claimer
+ExecStart=/opt/oci-a1-claimer/.venv/bin/python /opt/oci-a1-claimer/claimer.py
+Environment=CLAIMER_CONFIG=/etc/oci-a1-claimer/config.env
+Environment=STATE_DIR=/var/lib/oci-a1-claimer
+Environment=PYTHONUNBUFFERED=1
+
+# 結束碼：0 成功、2 設定錯誤、3 額度已滿、4 已建立但後續失敗、130 收到停止訊號
+# 只有非預期錯誤（1）才重啟；2/3/4 重啟沒有意義，4 更不能重啟去重新申請
+Restart=on-failure
+RestartSec=60
+RestartPreventExitStatus=2 3 4
+SuccessExitStatus=130
+
+# log 走 journald：journalctl -u oci-a1-claimer -f
+StandardOutput=journal
+StandardError=journal
+
+# 狀態檔目錄 /var/lib/oci-a1-claimer（ProtectSystem=strict 下唯一可寫的位置）
+StateDirectory=oci-a1-claimer
+StateDirectoryMode=0700
+UMask=0077
+
+# 強化
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

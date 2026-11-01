@@ -1,0 +1,17 @@
+# 機敏設定與執行結果
+config.env
+secrets/
+state/
+state.json
+result.json
+pending_launch.json
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本機工具設定
+.claude/
