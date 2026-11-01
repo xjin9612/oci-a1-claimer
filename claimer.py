@@ -172,6 +172,7 @@ class Settings:
     tg_bot_token: str = ""
     tg_chat_id: str = ""
     log_level: str = "INFO"
+    heartbeat_hours: float = 24.0       # 0 = 不發送定期回報
 
 
 # (環境變數 / 設定鍵, dataclass 欄位, 型別)
@@ -211,6 +212,7 @@ _SETTING_SPECS: list[tuple[str, str, str]] = [
     ("TG_BOT_TOKEN", "tg_bot_token", "str"),
     ("TG_CHAT_ID", "tg_chat_id", "str"),
     ("LOG_LEVEL", "log_level", "str"),
+    ("HEARTBEAT_HOURS", "heartbeat_hours", "float"),
 ]
 
 _REQUIRED = ("SUBNET_ID", "SSH_PUBLIC_KEY_FILE", "OCPUS", "MEMORY_GB", "FREE_OCPU_LIMIT", "FREE_MEMORY_GB_LIMIT")
@@ -634,6 +636,11 @@ class Claimer:
         self._rate_limit_streak = 0
         # 唯讀呼叫的預設時限；None 表示無限重試（正式執行），dry-run 會設定上限
         self.default_deadline: float | None = None
+        # 申請統計，供定期回報使用
+        self.stats = {"attempts": 0, "capacity": 0, "rate_limited": 0, "transient": 0, "network": 0}
+        self.rounds = 0
+        self.started_at = ""
+        self.next_heartbeat: float | None = None
 
     # ---- 共用工具 -------------------------------------------------------
 
@@ -856,6 +863,7 @@ class Claimer:
         network_failures = 0
         while True:
             self._check_stop()
+            self.stats["attempts"] += 1
             try:
                 resp = self.c.compute.launch_instance(
                     details, opc_retry_token=token, retry_strategy=oci.retry.NoneRetryStrategy())
@@ -877,6 +885,7 @@ class Claimer:
                     kind = ErrorKind.TRANSIENT
                 if kind is ErrorKind.CAPACITY:
                     self._rate_limit_streak = 0
+                    self.stats["capacity"] += 1
                     log.info("[%s] 容量不足", ad)
                     return None
                 if kind is ErrorKind.QUOTA:
@@ -884,6 +893,7 @@ class Claimer:
                 if kind is ErrorKind.CONFIG:
                     raise ConfigError(f"[{ad}] {describe_service_error(exc)}") from None
                 if kind is ErrorKind.RATE_LIMIT:
+                    self.stats["rate_limited"] += 1
                     delay = self._rate_limit_delay()
                     if uncertain:
                         log.warning("[%s] 被限流（429），退避 %.0f 秒後以同一 token 重送（先前結果不明）", ad, delay)
@@ -893,6 +903,7 @@ class Claimer:
                     self.sleep(delay)
                     return None
                 # TRANSIENT：伺服器有回應但失敗，以同一 token 重試，以防它其實已受理。
+                self.stats["transient"] += 1
                 transient_failures += 1
                 if not uncertain and transient_failures >= self.s.transient_max_attempts_per_ad:
                     log.warning("[%s] 暫時性錯誤 %d 次（%s），換下一個 AD",
@@ -906,6 +917,7 @@ class Claimer:
                 if not uncertain:
                     uncertain = True
                     self.save_pending(ad, token)
+                self.stats["network"] += 1
                 network_failures += 1
                 delay = self._transient_delay(network_failures)
                 log.warning("[%s] 網路錯誤 %s，%.0f 秒後以同一 token 重送", ad, type(exc).__name__, delay)
@@ -1070,19 +1082,44 @@ class Claimer:
                 return self._on_launched(ad, instance)
             self.check_usage()
 
-        round_no = 0
+        self.start_heartbeat(ads)
         while True:
-            round_no += 1
-            log.info("第 %d 輪，共 %d 個可用域", round_no, len(ads))
+            self.rounds += 1
+            log.info("第 %d 輪，共 %d 個可用域", self.rounds, len(ads))
             for idx, ad in enumerate(ads):
                 instance = self.try_launch(ad, details_by_ad[ad])
                 if instance is not None:
                     return self._on_launched(ad, instance)
                 if idx < len(ads) - 1:
                     self.sleep(self.s.per_ad_delay_seconds)
+            self.maybe_heartbeat()
             delay = self.s.interval_seconds + self.rng.uniform(0, self.s.jitter_seconds)
             log.info("本輪無果，%.0f 秒後再試", delay)
             self.sleep(delay)
+
+    # ---- 定期回報 -------------------------------------------------------
+
+    def start_heartbeat(self, ads: list[str]) -> None:
+        """開始輪詢時通知一次，並排定之後的定期回報；用來發現程式已無聲停止（例如主機睡眠）。"""
+        self.started_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %z")
+        if self.s.heartbeat_hours > 0:
+            self.next_heartbeat = self.clock() + self.s.heartbeat_hours * 3600
+        self.notifier.send(
+            f"oci-a1-claimer 開始申請\n規格：{self.s.ocpus:g} OCPU / {self.s.memory_gb:g} GB\n"
+            f"區域：{self.c.region}（{len(ads)} 個可用域）\n"
+            + (f"每 {self.s.heartbeat_hours:g} 小時回報一次進度" if self.next_heartbeat else "未啟用定期回報"))
+
+    def maybe_heartbeat(self) -> None:
+        if self.next_heartbeat is None or self.clock() < self.next_heartbeat:
+            return
+        st = self.stats
+        msg = (f"oci-a1-claimer 仍在執行（自 {self.started_at}）\n"
+               f"已嘗試 {st['attempts']} 次、{self.rounds} 輪\n"
+               f"容量不足 {st['capacity']}、限流 {st['rate_limited']}、"
+               f"暫時錯誤 {st['transient']}、網路錯誤 {st['network']}")
+        log.info(msg.replace("\n", "；"))
+        self.notifier.send(msg)
+        self.next_heartbeat = self.clock() + self.s.heartbeat_hours * 3600
 
     def dry_run(self) -> int:
         # dry-run 是互動驗證，網路不通時不無限等待

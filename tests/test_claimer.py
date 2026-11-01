@@ -232,7 +232,9 @@ class TestLaunchLoop(ClaimerTestBase):
         if os.name == "posix":
             self.assertEqual(stat.S_IMODE(self.result_path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(self.state_path.stat().st_mode), 0o600)
-        self.notifier.send.assert_called_once()
+        # 開始通知 + 成功通知
+        self.assertEqual(self.notifier.send.call_count, 2)
+        self.assertIn("開始申請", self.notifier.send.call_args_list[0].args[0])
         self.assertIn("203.0.113.10", self.notifier.send.call_args.args[0])
 
     def test_post_launch_failure_does_not_relaunch(self):
@@ -477,6 +479,35 @@ class TestSecrets(unittest.TestCase):
         out = "\n".join(logs.output)
         self.assertIn("bot was blocked", out)
         self.assertNotIn(token, out)
+
+
+class TestHeartbeat(ClaimerTestBase):
+    def _messages(self):
+        return [c.args[0] for c in self.notifier.send.call_args_list]
+
+    def test_heartbeat_reports_progress(self):
+        """每隔 HEARTBEAT_HOURS 回報一次累計嘗試次數，用來確認程式仍在執行。"""
+        self.settings.heartbeat_hours = 0.1  # 6 分鐘；每輪約 61~71 秒
+        self.compute.launch_instance.side_effect = [capacity_error()] * 20 + [resp(make_instance())]
+        self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
+        beats = [m for m in self._messages() if "仍在執行" in m]
+        self.assertGreaterEqual(len(beats), 1)
+        self.assertIn("容量不足", beats[0])
+        self.assertEqual(self.claimer.stats["attempts"], 21)
+        self.assertEqual(self.claimer.stats["capacity"], 20)
+
+    def test_heartbeat_disabled(self):
+        self.settings.heartbeat_hours = 0
+        self.compute.launch_instance.side_effect = [capacity_error()] * 20 + [resp(make_instance())]
+        self.claimer.run()
+        msgs = self._messages()
+        self.assertFalse([m for m in msgs if "仍在執行" in m])
+        self.assertIn("未啟用定期回報", msgs[0])
+
+    def test_no_start_notice_in_resume_mode(self):
+        claimer.write_json_atomic(self.state_path, {"status": "launched", "instance_id": "ocid1.instance.oc1..new"})
+        self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
+        self.assertFalse([m for m in self._messages() if "開始申請" in m])
 
 
 class TestUncertainLaunch(ClaimerTestBase):

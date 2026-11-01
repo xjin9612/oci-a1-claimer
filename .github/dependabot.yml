@@ -1,0 +1,11 @@
+# 每週檢查 Python 相依套件（requirements.in / requirements.txt）與 GitHub Actions 的更新
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

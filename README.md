@@ -6,6 +6,8 @@
 
 <p align="center">English | <a href="README.zh-TW.md">繁體中文</a></p>
 
+<p align="center"><a href="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml"><img src="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+
 Keeps requesting an OCI Always Free `VM.Standard.A1.Flex` (ARM) instance through the official OCI API until it succeeds.
 
 - Tries every availability domain (AD) in turn; on "out of capacity" it moves to the next one and sleeps with random jitter after each round.
@@ -77,7 +79,7 @@ Follow the prompts:
 3. Press Start in the new bot's chat, send it any message, then press Enter in the terminal.
 4. Pick your own account from the listed chats. Anyone can message a bot, so the script never picks one automatically.
 
-The script verifies the token, finds the chat id, sends a test message, and writes `TG_BOT_TOKEN` and `TG_CHAT_ID` to `config.env`. Restart the claimer for it to take effect. Notifications are sent when an instance is created (with its public IP), when the tool stops because the allowance is used up, and when the instance was created but a follow-up step failed.
+The script verifies the token, finds the chat id, sends a test message, and writes `TG_BOT_TOKEN` and `TG_CHAT_ID` to `config.env`. Restart the claimer for it to take effect. Notifications are sent when claiming starts, every `HEARTBEAT_HOURS` hours with progress (default 24; `0` disables), when an instance is created (with its public IP), when the tool stops because the allowance is used up, and when the instance was created but a follow-up step failed. If the periodic report stops arriving, the tool is no longer running (for example, the host went to sleep).
 
 If sending fails, the log shows Telegram's error description, such as `chat not found` (wrong chat id) or `bot was blocked by the user`. If the token leaks, send `/revoke` to @BotFather to issue a new one.
 
@@ -234,7 +236,13 @@ References:
 python -m unittest discover -s tests -v
 ```
 
-The OCI clients are mocked, so no real API calls are made. Covered: AD rotation, 429 backoff, quota stop, usage check, home region check, the success path, post-launch failures and resume, idempotency when the outcome is unknown, network recovery, exit codes, config parsing, file permissions, and log redaction.
+GitHub Actions runs the tests on Python 3.10, 3.12, and 3.14 plus `shellcheck` on every push and pull request. The OCI clients are mocked, so no real API calls are made. Covered: AD rotation, 429 backoff, quota stop, usage check, home region check, the success path, post-launch failures and resume, idempotency when the outcome is unknown, network recovery, exit codes, config parsing, file permissions, log redaction, and the periodic progress report.
+
+## Dependencies
+
+- `requirements.in` lists the direct dependency (`oci`); `requirements.txt` is generated from it with every transitive package pinned and hash-verified, so installs fail if a downloaded file does not match.
+- To upgrade, edit `requirements.in` and regenerate: `pip install pip-tools && pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements.txt requirements.in`.
+- Dependabot checks Python dependencies and GitHub Actions weekly and opens pull requests for updates.
 
 ## Known limitations
 

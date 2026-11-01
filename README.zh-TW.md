@@ -6,6 +6,8 @@
 
 <p align="center"><a href="README.md">English</a> | 繁體中文</p>
 
+<p align="center"><a href="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml"><img src="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+
 持續透過 OCI 官方 API 申請 Always Free 的 `VM.Standard.A1.Flex`（ARM）實例，直到成功為止。
 
 - 依序嘗試每個可用域（AD）；容量不足就換下一個，整輪結束後休息並加隨機 jitter。
@@ -76,7 +78,7 @@ log 持續出現「容量不足」與「本輪無果」是正常的，代表正�
 3. 對新 Bot 按「開始」並傳一則訊息，回到終端機按 Enter。
 4. 從列出的對話中選擇你自己的帳號。任何人都能私訊 Bot，因此腳本不會自動選擇。
 
-腳本會驗證 token、取得 chat id、發送測試訊息，並寫入 `config.env` 的 `TG_BOT_TOKEN`、`TG_CHAT_ID`。重新啟動 claimer 後生效。通知時機：申請成功（附公網 IP）、額度已滿而停止、實例已建立但後續步驟失敗。
+腳本會驗證 token、取得 chat id、發送測試訊息，並寫入 `config.env` 的 `TG_BOT_TOKEN`、`TG_CHAT_ID`。重新啟動 claimer 後生效。通知時機：開始申請時、每 `HEARTBEAT_HOURS` 小時回報一次進度（預設 24，設 `0` 關閉）、申請成功（附公網 IP）、額度已滿而停止、實例已建立但後續步驟失敗。定期回報沒有如期出現，代表程式已停止（例如主機進入睡眠）。
 
 發送失敗時 log 會顯示 Telegram 的錯誤說明，例如 `chat not found`（chat id 錯誤）、`bot was blocked by the user`（已封鎖 Bot）。token 外洩時到 @BotFather 傳 `/revoke` 重新產生。
 
@@ -233,7 +235,13 @@ Allow group oci-a1-claimer to use virtual-network-family in compartment <network
 python -m unittest discover -s tests -v
 ```
 
-以 mock 取代 OCI client，不呼叫真實 API。涵蓋 AD 輪替、429 退避、額度停止、用量檢查、home region 檢查、成功路徑、建立後步驟失敗與續做、結果不明時的冪等保護、網路中斷恢復、結束碼、設定解析、檔案權限與 log 遮蔽。
+每次 push 與 pull request 會由 GitHub Actions 在 Python 3.10、3.12、3.14 執行測試，並以 `shellcheck` 檢查 `setup.sh`。以 mock 取代 OCI client，不呼叫真實 API。涵蓋 AD 輪替、429 退避、額度停止、用量檢查、home region 檢查、成功路徑、建立後步驟失敗與續做、結果不明時的冪等保護、網路中斷恢復、結束碼、設定解析、檔案權限、log 遮蔽與定期回報。
+
+## 相依套件
+
+- `requirements.in` 列出直接相依（`oci`）；`requirements.txt` 由它產生，固定所有間接相依的版本並附 hash，下載的檔案與 hash 不符時安裝會失敗。
+- 升級時修改 `requirements.in` 後重新產生：`pip install pip-tools && pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements.txt requirements.in`。
+- Dependabot 每週檢查 Python 相依套件與 GitHub Actions 的更新，並自動發 pull request。
 
 ## 已知限制
 
