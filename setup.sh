@@ -181,16 +181,33 @@ def api(method, **params):
 
 me = api("getMe")
 print(f"[資訊] token 有效，Bot：@{me['username']}")
-with open("/dev/tty") as tty:
-    print(f"3. 在 Telegram 打開 @{me['username']}，按「開始」並傳一則訊息，完成後回到這裡按 Enter", end="", flush=True)
-    tty.readline()
+tty = open("/dev/tty")
+print(f"3. 在 Telegram 打開 @{me['username']}，按「開始」並傳一則訊息，完成後回到這裡按 Enter", end="", flush=True)
+tty.readline()
 
-chats = [u["message"]["chat"] for u in api("getUpdates") if "message" in u]
+# 任何人都能找到並私訊這個 Bot，因此列出所有來源讓使用者確認，避免通知（含 IP、OCID）送到陌生人
+chats = {}
+for u in api("getUpdates"):
+    if "message" in u:
+        c = u["message"]["chat"]
+        chats[c["id"]] = c
 if not chats:
     sys.exit("[錯誤] 沒有收到任何訊息：請確認已對 Bot 傳訊息，再重新執行 ./setup.sh --telegram")
-chat = chats[-1]
-name = chat.get("title") or " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")]))
-print(f"[資訊] chat id：{chat['id']}（{name}）")
+
+def label(c):
+    name = c.get("title") or " ".join(filter(None, [c.get("first_name"), c.get("last_name")]))
+    user = f" @{c['username']}" if c.get("username") else ""
+    return f"{c['id']}（{name}{user}，{c.get('type', '')}）"
+
+options = list(chats.values())
+for i, c in enumerate(options, 1):
+    print(f"   {i}. {label(c)}")
+print("4. 輸入要接收通知的編號（應為你自己的帳號）後按 Enter：", end="", flush=True)
+choice = tty.readline().strip()
+if not choice.isdigit() or not 1 <= int(choice) <= len(options):
+    sys.exit("[錯誤] 未選擇有效的編號，已取消，config.env 未變更")
+chat = options[int(choice) - 1]
+print(f"[資訊] chat id：{label(chat)}")
 
 api("sendMessage", chat_id=chat["id"], text="oci-a1-claimer：Telegram 通知設定完成")
 print("[資訊] 已發送測試訊息，請確認 Telegram 有收到")

@@ -75,6 +75,7 @@ Follow the prompts:
 1. In Telegram, search for **@BotFather** (exact handle, verified badge) and send `/newbot` to create a bot.
 2. Paste the token. Input is hidden and does not go into shell history.
 3. Press Start in the new bot's chat, send it any message, then press Enter in the terminal.
+4. Pick your own account from the listed chats. Anyone can message a bot, so the script never picks one automatically.
 
 The script verifies the token, finds the chat id, sends a test message, and writes `TG_BOT_TOKEN` and `TG_CHAT_ID` to `config.env`. Restart the claimer for it to take effect. Notifications are sent when an instance is created (with its public IP), when the tool stops because the allowance is used up, and when the instance was created but a follow-up step failed.
 
