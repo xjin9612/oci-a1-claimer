@@ -118,7 +118,51 @@ Allow group oci-a1-claimer to use subnets in tenancy
 Allow group oci-a1-claimer to use network-security-groups in tenancy
 ```
 
-群組位於 Default 網域時可省略網域名稱（[Policy Subjects](https://docs.oracle.com/en-us/iaas/Content/Identity/policysyntax/subject.htm)）。以上範圍為整個租用戶；要進一步縮小，可另建區間放 VCN 與實例，把 `tenancy` 換成 `compartment <名稱>`。各語句用途見 [README 的「最小權限 IAM」](../README.zh-TW.md#最小權限-iam)。
+群組位於 Default 網域時可省略網域名稱（[Policy Subjects](https://docs.oracle.com/en-us/iaas/Content/Identity/policysyntax/subject.htm)）。以上範圍為整個租用戶；要進一步縮小，可另建區間放 VCN 與實例，見下方。
+
+### 依區間限縮與各語句用途
+
+以下為依區間（compartment）限縮的版本。`<instance-compartment>` 為實例所在區間，`<network-compartment>` 為 VCN / 子網所在區間，相同時填同一個名稱；全部放在根區間時，將 `compartment <名稱>` 換成 `tenancy`。
+
+```text
+Allow group oci-a1-claimer to inspect tenancies in tenancy
+Allow group oci-a1-claimer to inspect compartments in tenancy
+Allow group oci-a1-claimer to read app-catalog-listing in tenancy
+Allow group oci-a1-claimer to manage instances in compartment <instance-compartment>
+Allow group oci-a1-claimer to read instance-images in compartment <instance-compartment>
+Allow group oci-a1-claimer to inspect vnic-attachments in compartment <instance-compartment>
+Allow group oci-a1-claimer to use vnics in compartment <instance-compartment>
+Allow group oci-a1-claimer to use subnets in compartment <network-compartment>
+Allow group oci-a1-claimer to use network-security-groups in compartment <network-compartment>
+```
+
+| 語句 | 用途 |
+|---|---|
+| `inspect tenancies in tenancy` | `ListRegionSubscriptions`（home region 檢查） |
+| `inspect compartments in tenancy` | `ListAvailabilityDomains` |
+| `read app-catalog-listing in tenancy` | `LaunchInstance` 附帶需求 |
+| `manage instances` | `LaunchInstance`；涵蓋 `ListInstances` / `GetInstance` |
+| `read instance-images` | `LaunchInstance` 附帶需求；涵蓋 `ListImages` / `GetImage` |
+| `inspect vnic-attachments` | `ListVnicAttachments` |
+| `use vnics` | `LaunchInstance` 附帶需求；涵蓋 `GetVnic` |
+| `use subnets` | `LaunchInstance` 附帶需求；涵蓋 `GetSubnet` |
+| `use network-security-groups` | `LaunchInstance` 附帶需求 |
+
+- 刻意不授權 `manage instance-family`、`use volume-family` 與任何 VCN 建立 / 刪除權限。`manage instances` 仍含終止實例的權限，這是 `LaunchInstance` 的最低 verb。
+- 有設定 `USAGE_EXTRA_COMPARTMENT_IDS` 時，那些 compartment 另需 `read instances`。
+- 遇到 404 `NotAuthorizedOrNotFound` 時，可先改用官方較寬的範本確認問題不在權限，再逐步收斂：
+
+```text
+Allow group oci-a1-claimer to manage instance-family in compartment <instance-compartment>
+Allow group oci-a1-claimer to read app-catalog-listing in tenancy
+Allow group oci-a1-claimer to use virtual-network-family in compartment <network-compartment>
+```
+
+依據：
+- [Details for the Core Services](https://docs.oracle.com/en-us/iaas/Content/Identity/Reference/corepolicyreference.htm)
+- [Details for IAM with Identity Domains](https://docs.oracle.com/en-us/iaas/Content/Identity/policyreference/iampolicyreference.htm)
+- [Common Policies](https://docs.oracle.com/en-us/iaas/Content/Identity/Concepts/commonpolicies.htm)
+- [Policy Syntax](https://docs.oracle.com/en-us/iaas/Content/Identity/Concepts/policysyntax.htm)
 
 ## 7. 產生 API Key
 

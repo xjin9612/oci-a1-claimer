@@ -91,74 +91,6 @@ If sending fails, the log shows Telegram's error description, such as `chat not 
 - Relative paths in `SSH_PUBLIC_KEY_FILE`, `STATE_DIR`, and `OCI_CONFIG_FILE` are resolved against the config file's directory.
 - To change region, set `REGION` (for example `ap-tokyo-1`) or edit `region` in `secrets/oci_config`.
 
-## How it works
-
-```
-start
- ├─ state.json exists?
- │    ├─ completed → already done, exit (0)
- │    ├─ launched  → resume mode: finish post-launch steps only, never re-launch
- │    └─ corrupted → needs manual check, exit (4)
- ├─ check SSH key, home region, availability domains, subnet, image
- ├─ pending_launch.json exists? → resend with the same AD, token, and request first, continue only on a definite result
- ├─ usage check: used + requested > limit → exit (3)
- └─ loop: call launch_instance for each AD
-        out of capacity → next AD
-        429             → long backoff (doubles when repeated, capped), then next AD
-        quota exceeded  → exit (3)
-        auth / params   → exit (2)
-        network error   → outcome unknown: write pending, resend only with the same AD + token until a definite result
-        other 5xx       → retry a few times with the same token, then next AD
-      end of round → sleep INTERVAL_SECONDS + 0~JITTER_SECONDS
- success → write state.json → wait for RUNNING → get public IP → write result.json → notify → exit (0)
-```
-
-### Exit codes
-
-| Code | Meaning | Restarted by systemd |
-|---|---|---|
-| 0 | Success, dry-run passed, or already completed earlier | No |
-| 1 | Unexpected error | Yes |
-| 2 | Config / permission error (including unreadable config, private key, or SSH key; non-home region) | No |
-| 3 | Free allowance used up, or `LimitExceeded` / `QuotaExceeded` | No |
-| 4 | Instance created but a follow-up step failed, or state is uncertain and needs a manual check | No |
-| 130 | Received SIGINT / SIGTERM | No |
-
-### State files
-
-All live in `STATE_DIR`, are written atomically, and have mode `0600`.
-
-| File | Content |
-|---|---|
-| `state.json` | Written the moment an instance is created. While it exists, no new launch is attempted; delete it to claim another instance |
-| `result.json` | Final result: instance OCID, AD, public / private IP |
-| `pending_launch.json` | AD, retry token, and request parameters (image, OCPUs, memory, boot volume) of the launch in flight; written before each launch request and removed once a definite result arrives |
-| `claimer.lock` | Empty lock file; only one process may claim from a `STATE_DIR` at a time |
-
-### Error classification
-
-Based mainly on HTTP status and OCI error code, with the message as a fallback ([API Errors](https://docs.oracle.com/en-us/iaas/Content/API/References/apierrors.htm)):
-
-| Condition | Class |
-|---|---|
-| 429 | Rate limited |
-| `LimitExceeded` / `QuotaExceeded` | Allowance exceeded |
-| 5xx with `capacity` in the message | Out of capacity |
-| Other 5xx; 409 `IncorrectState` / `ExternalServerIncorrectState` / `LockConflict` | Transient |
-| Other 4xx | Config error |
-| `oci.exceptions.RequestException` / `ConnectTimeout`, `ConnectionError`, `TimeoutError` | Network error |
-
-"Out of capacity" is not in the official error table; the actual response is `500 / InternalError / "Out of host capacity."`. If the message format ever changes, it is treated as a transient error and retried with backoff rather than stopping the tool.
-
-### Idempotency
-
-- Every `launch_instance` call carries a self-generated `opc_retry_token` and passes `NoneRetryStrategy()`, so the SDK does not auto-retry 429s and defeat the long backoff.
-- Before each `launch_instance` call the AD, token, and request parameters are written to `pending_launch.json`. If the call is interrupted in any way (network error, unexpected exception, the process being killed), the next start resends with the same AD, token, and parameters: if the instance was created, the server returns that same instance.
-- While the outcome is unknown, 429, 5xx, and retryable 409 only trigger backoff, never a new token. A 409 `InvalidatedRetryToken` means the earlier request may have created an instance, so the tool stops with exit code 4.
-- Retry tokens are valid for 24 hours; if the outcome is still unknown after 23 hours (at startup or while retrying), the tool stops with exit code 4 and asks for a manual check.
-- Only one process may claim from a `STATE_DIR` at a time; a second one exits with code 2. Runs with different `STATE_DIR`s (for example a local run and the systemd service) are not protected from each other, so do not run both.
-- The SDK circuit breaker is explicitly disabled on all clients, so consecutive out-of-capacity 500s do not block later calls.
-
 ## Running as a systemd service
 
 ```bash
@@ -187,75 +119,37 @@ Installed layout:
 - `config.env` must use the default `secrets/` paths. Keep secrets such as the Telegram token in `config.env`, not in the unit's `Environment=`.
 - On WSL, first set `systemd=true` under `[boot]` in `/etc/wsl.conf` and restart WSL.
 
+## Exit codes and result files
+
+| Code | Meaning | Restarted by systemd |
+|---|---|---|
+| 0 | Success, dry-run passed, or already completed earlier | No |
+| 1 | Unexpected error | Yes |
+| 2 | Config / permission error (including unreadable config, private key, or SSH key; non-home region) | No |
+| 3 | Free allowance used up, or `LimitExceeded` / `QuotaExceeded` | No |
+| 4 | Instance created but a follow-up step failed, or state is uncertain and needs a manual check | No |
+| 130 | Received SIGINT / SIGTERM | No |
+
+- The result is written to `result.json` in `STATE_DIR` (instance OCID, AD, public / private IP).
+- `state.json` is written the moment an instance is created; while it exists no new launch is attempted, so delete it to claim another instance.
+- On exit code 4, the log and the Telegram message explain the cause and what to do.
+
 ## Least-privilege IAM
 
-Run the tool with a dedicated IAM user, not the administrator's API key. Console steps for creating the user, group, and API key are in [docs/oracle-setup.md](docs/oracle-setup.md).
-
-The policy below is scoped by compartment. `<instance-compartment>` holds the instance and `<network-compartment>` holds the VCN / subnet; use the same name if they are the same. If everything lives in the root compartment, replace `compartment <name>` with `tenancy`.
-
-```text
-Allow group oci-a1-claimer to inspect tenancies in tenancy
-Allow group oci-a1-claimer to inspect compartments in tenancy
-Allow group oci-a1-claimer to read app-catalog-listing in tenancy
-Allow group oci-a1-claimer to manage instances in compartment <instance-compartment>
-Allow group oci-a1-claimer to read instance-images in compartment <instance-compartment>
-Allow group oci-a1-claimer to inspect vnic-attachments in compartment <instance-compartment>
-Allow group oci-a1-claimer to use vnics in compartment <instance-compartment>
-Allow group oci-a1-claimer to use subnets in compartment <network-compartment>
-Allow group oci-a1-claimer to use network-security-groups in compartment <network-compartment>
-```
-
-| Statement | Purpose |
-|---|---|
-| `inspect tenancies in tenancy` | `ListRegionSubscriptions` (home region check) |
-| `inspect compartments in tenancy` | `ListAvailabilityDomains` |
-| `read app-catalog-listing in tenancy` | Required by `LaunchInstance` |
-| `manage instances` | `LaunchInstance`; covers `ListInstances` / `GetInstance` |
-| `read instance-images` | Required by `LaunchInstance`; covers `ListImages` / `GetImage` |
-| `inspect vnic-attachments` | `ListVnicAttachments` |
-| `use vnics` | Required by `LaunchInstance`; covers `GetVnic` |
-| `use subnets` | Required by `LaunchInstance`; covers `GetSubnet` |
-| `use network-security-groups` | Required by `LaunchInstance` |
-
-- `manage instance-family`, `use volume-family`, and any VCN create / delete permissions are intentionally not granted. `manage instances` still includes terminating instances; it is the minimum verb for `LaunchInstance`.
-- When `USAGE_EXTRA_COMPARTMENT_IDS` is set, those compartments also need `read instances`.
-- If you hit 404 `NotAuthorizedOrNotFound`, try Oracle's broader template first to rule out permissions, then narrow it down:
-
-```text
-Allow group oci-a1-claimer to manage instance-family in compartment <instance-compartment>
-Allow group oci-a1-claimer to read app-catalog-listing in tenancy
-Allow group oci-a1-claimer to use virtual-network-family in compartment <network-compartment>
-```
-
-References:
-- [Details for the Core Services](https://docs.oracle.com/en-us/iaas/Content/Identity/Reference/corepolicyreference.htm)
-- [Details for IAM with Identity Domains](https://docs.oracle.com/en-us/iaas/Content/Identity/policyreference/iampolicyreference.htm)
-- [Common Policies](https://docs.oracle.com/en-us/iaas/Content/Identity/Concepts/commonpolicies.htm)
-- [Policy Syntax](https://docs.oracle.com/en-us/iaas/Content/Identity/Concepts/policysyntax.htm)
-
-## Tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-GitHub Actions runs the tests on Python 3.10, 3.12, and 3.14 plus `shellcheck` on `setup.sh` for pushes to `main` and every pull request. The OCI clients are mocked, so no real API calls are made. Covered: AD rotation, 429 backoff, quota stop, usage check, home region check, the success path, post-launch failures and resume, idempotency when the outcome is unknown, duplicate-launch guards (pending before launch, token expiry, state lock), network recovery, exit codes, config parsing, file permissions, log redaction, and the periodic progress report.
-
-## Dependencies
-
-- `requirements.in` lists the direct dependency (`oci`); `requirements.txt` is generated from it with every transitive package pinned and hash-verified, so installs fail if a downloaded file does not match.
-- To upgrade, edit `requirements.in` and regenerate: `pip install pip-tools && pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements.txt requirements.in`.
-- Dependabot checks Python dependencies and GitHub Actions weekly and opens pull requests for updates.
+Run the tool with a dedicated IAM user, not the administrator's API key. Steps for creating the user, group, and policy, and what each policy statement is for, are in [docs/oracle-setup.md](docs/oracle-setup.md#6-建立-policy) (Traditional Chinese).
 
 ## Known limitations
 
 - The usage check only looks at `COMPARTMENT_ID` and `USAGE_EXTRA_COMPARTMENT_IDS`; the free allowance applies to the whole tenancy.
 - Instances in `STOPPED` state also count toward usage (conservative).
-- Deleting `pending_launch.json` while an outcome is unknown defeats the idempotency protection.
-- "Resending with the same token after an unknown outcome and getting out-of-capacity" is treated as "the original request created nothing". This follows from retry-token semantics but is not stated verbatim in Oracle's docs.
-- If writing `state.json` fails right after a successful launch (for example, disk full), the tool exits with code 4 and notifies you; `pending_launch.json` is kept, so the next start resends with the same token and picks up that instance.
+- Only one process may claim from a `STATE_DIR` at a time. A local run and the systemd service use different `STATE_DIR`s and cannot detect each other, so do not run both.
+- Do not delete `pending_launch.json` yourself, or an instance may be created twice; delete it only when the tool asks for a manual check and you have confirmed in the Console that no extra instance exists.
 - In resume mode, if the instance has been terminated, the tool keeps exiting with code 4; delete `state.json` manually after checking.
 - Whether assigning a public IP needs an extra `public-ips` permission is not yet verified (it can only be confirmed after a successful launch).
+
+## Development
+
+How it works, error classification, idempotency, tests, and dependencies are described in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) (Traditional Chinese).
 
 ## License
 

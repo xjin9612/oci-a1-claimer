@@ -90,74 +90,6 @@ log 持續出現「容量不足」與「本輪無果」是正常的，代表正�
 - `SSH_PUBLIC_KEY_FILE`、`STATE_DIR`、`OCI_CONFIG_FILE` 的相對路徑以設定檔所在目錄為基準。
 - 換 region：設定 `REGION`（例如 `ap-tokyo-1`），或改 `secrets/oci_config` 的 `region`。
 
-## 運作流程
-
-```
-啟動
- ├─ state.json 存在？
- │    ├─ completed → 已完成，結束（0）
- │    ├─ launched  → 續做模式：只補做建立後步驟，不重新申請
- │    └─ 損毀      → 需人工確認，結束（4）
- ├─ 檢查 SSH 公鑰、home region、可用域、子網、映像檔
- ├─ pending_launch.json 存在？ → 先以原 AD、原 token、原申請內容重送，拿到明確結果才繼續
- ├─ 用量檢查：已用 + 本次申請 > 上限 → 結束（3）
- └─ 迴圈：對每個 AD 呼叫 launch_instance
-        容量不足  → 下一個 AD
-        429       → 長退避（連續時加倍，有上限）後換下一個 AD
-        配額超限  → 結束（3）
-        權限/參數 → 結束（2）
-        網路錯誤  → 結果不明：寫 pending，只用同一 AD + token 重送，直到拿到明確結果
-        其他 5xx  → 同一 token 重試數次，仍失敗換下一個 AD
-      整輪結束 → sleep INTERVAL_SECONDS + 0~JITTER_SECONDS
- 成功 → 寫 state.json → 等 RUNNING → 取公網 IP → 寫 result.json → 通知 → 結束（0）
-```
-
-### 結束碼
-
-| 碼 | 意義 | systemd 重啟 |
-|---|---|---|
-| 0 | 成功、dry-run 通過，或先前已完成 | 否 |
-| 1 | 未預期錯誤 | 是 |
-| 2 | 設定 / 權限錯誤（含設定檔、私鑰、SSH 公鑰讀取失敗，非 home region） | 否 |
-| 3 | 免費額度已滿，或 `LimitExceeded` / `QuotaExceeded` | 否 |
-| 4 | 實例已建立但後續步驟失敗，或狀態不明需人工確認 | 否 |
-| 130 | 收到 SIGINT / SIGTERM | 否 |
-
-### 狀態檔
-
-都放在 `STATE_DIR`，以原子方式寫入，權限 `0600`。
-
-| 檔案 | 內容 |
-|---|---|
-| `state.json` | 建立成功當下立即寫入。存在時不會再申請；要再申請一台請先刪除 |
-| `result.json` | 最終結果：instance OCID、AD、公網 / 私有 IP |
-| `pending_launch.json` | 進行中申請的 AD、retry token 與申請參數（映像檔、OCPU、記憶體、開機磁碟）；每次送出申請前寫入，拿到明確結果後刪除 |
-| `claimer.lock` | 空的鎖檔；同一個 `STATE_DIR` 同時只允許一個程序申請 |
-
-### 錯誤分類
-
-以 HTTP status 與 OCI error code 為主，訊息字串為輔（[API Errors](https://docs.oracle.com/en-us/iaas/Content/API/References/apierrors.htm)）：
-
-| 條件 | 分類 |
-|---|---|
-| 429 | 限流 |
-| `LimitExceeded` / `QuotaExceeded` | 額度不足 |
-| 5xx 且訊息含 `capacity` | 容量不足 |
-| 其他 5xx；409 `IncorrectState` / `ExternalServerIncorrectState` / `LockConflict` | 暫時性錯誤 |
-| 其他 4xx | 設定錯誤 |
-| `oci.exceptions.RequestException` / `ConnectTimeout`、`ConnectionError`、`TimeoutError` | 網路錯誤 |
-
-容量不足不在官方錯誤表內，實際回應為 `500 / InternalError / "Out of host capacity."`。訊息格式若改變，會被當成暫時性錯誤退避重試，不會中斷。
-
-### 冪等設計
-
-- `launch_instance` 一律帶自行產生的 `opc_retry_token`，並在呼叫時傳 `NoneRetryStrategy()`，避免 SDK 自動重試 429 干擾長退避。
-- 每次呼叫 `launch_instance` 前，先把 AD、token 與申請參數寫入 `pending_launch.json`。呼叫因任何原因中斷（網路錯誤、非預期例外、程序被終止），下次啟動都會以同一個 AD、token 與參數重送：若已建立，伺服器會回傳同一台實例。
-- 結果不明期間遇到 429、5xx、可重試的 409 只退避，不換 token。409 `InvalidatedRetryToken` 代表先前的請求可能已建立實例，因此以結束碼 4 停止。
-- retry token 有效 24 小時；結果不明超過 23 小時（啟動時或重送期間）就以結束碼 4 停止並要求人工確認。
-- 同一個 `STATE_DIR` 同時只允許一個程序申請，第二個以結束碼 2 退出。不同 `STATE_DIR` 之間（例如本機執行與 systemd 服務）無法互相保護，不要同時執行。
-- 所有 client 明確停用 SDK 斷路器，避免連續的容量不足 500 讓後續呼叫被擋下。
-
 ## 以 systemd 長期執行
 
 ```bash
@@ -186,75 +118,37 @@ sudo cat /var/lib/oci-a1-claimer/result.json
 - `config.env` 須使用預設的 `secrets/` 路徑。Telegram token 等機密放在 `config.env`，不要寫進 unit 的 `Environment=`。
 - WSL 需先在 `/etc/wsl.conf` 設定 `[boot]` 下的 `systemd=true` 並重啟 WSL。
 
+## 結束碼與結果檔
+
+| 碼 | 意義 | systemd 重啟 |
+|---|---|---|
+| 0 | 成功、dry-run 通過，或先前已完成 | 否 |
+| 1 | 未預期錯誤 | 是 |
+| 2 | 設定 / 權限錯誤（含設定檔、私鑰、SSH 公鑰讀取失敗，非 home region） | 否 |
+| 3 | 免費額度已滿，或 `LimitExceeded` / `QuotaExceeded` | 否 |
+| 4 | 實例已建立但後續步驟失敗，或狀態不明需人工確認 | 否 |
+| 130 | 收到 SIGINT / SIGTERM | 否 |
+
+- 結果寫在 `STATE_DIR` 的 `result.json`（instance OCID、AD、公網 / 私有 IP）。
+- `state.json` 在建立成功當下寫入；存在時不會再申請，要再申請一台請先刪除它。
+- 結束碼 4 時，log 與 Telegram 訊息會說明原因與處理方式。
+
 ## 最小權限 IAM
 
-用專用的 IAM 使用者執行，不要用管理員帳號的 API 金鑰。建立使用者、群組與 API Key 的主控台操作見 [docs/oracle-setup.md](docs/oracle-setup.md)。
-
-以下為依區間（compartment）限縮的版本。`<instance-compartment>` 為實例所在區間，`<network-compartment>` 為 VCN / 子網所在區間，相同時填同一個名稱；全部放在根區間時，將 `compartment <名稱>` 換成 `tenancy`。
-
-```text
-Allow group oci-a1-claimer to inspect tenancies in tenancy
-Allow group oci-a1-claimer to inspect compartments in tenancy
-Allow group oci-a1-claimer to read app-catalog-listing in tenancy
-Allow group oci-a1-claimer to manage instances in compartment <instance-compartment>
-Allow group oci-a1-claimer to read instance-images in compartment <instance-compartment>
-Allow group oci-a1-claimer to inspect vnic-attachments in compartment <instance-compartment>
-Allow group oci-a1-claimer to use vnics in compartment <instance-compartment>
-Allow group oci-a1-claimer to use subnets in compartment <network-compartment>
-Allow group oci-a1-claimer to use network-security-groups in compartment <network-compartment>
-```
-
-| 語句 | 用途 |
-|---|---|
-| `inspect tenancies in tenancy` | `ListRegionSubscriptions`（home region 檢查） |
-| `inspect compartments in tenancy` | `ListAvailabilityDomains` |
-| `read app-catalog-listing in tenancy` | `LaunchInstance` 附帶需求 |
-| `manage instances` | `LaunchInstance`；涵蓋 `ListInstances` / `GetInstance` |
-| `read instance-images` | `LaunchInstance` 附帶需求；涵蓋 `ListImages` / `GetImage` |
-| `inspect vnic-attachments` | `ListVnicAttachments` |
-| `use vnics` | `LaunchInstance` 附帶需求；涵蓋 `GetVnic` |
-| `use subnets` | `LaunchInstance` 附帶需求；涵蓋 `GetSubnet` |
-| `use network-security-groups` | `LaunchInstance` 附帶需求 |
-
-- 刻意不授權 `manage instance-family`、`use volume-family` 與任何 VCN 建立 / 刪除權限。`manage instances` 仍含終止實例的權限，這是 `LaunchInstance` 的最低 verb。
-- 有設定 `USAGE_EXTRA_COMPARTMENT_IDS` 時，那些 compartment 另需 `read instances`。
-- 遇到 404 `NotAuthorizedOrNotFound` 時，可先改用官方較寬的範本確認問題不在權限，再逐步收斂：
-
-```text
-Allow group oci-a1-claimer to manage instance-family in compartment <instance-compartment>
-Allow group oci-a1-claimer to read app-catalog-listing in tenancy
-Allow group oci-a1-claimer to use virtual-network-family in compartment <network-compartment>
-```
-
-依據：
-- [Details for the Core Services](https://docs.oracle.com/en-us/iaas/Content/Identity/Reference/corepolicyreference.htm)
-- [Details for IAM with Identity Domains](https://docs.oracle.com/en-us/iaas/Content/Identity/policyreference/iampolicyreference.htm)
-- [Common Policies](https://docs.oracle.com/en-us/iaas/Content/Identity/Concepts/commonpolicies.htm)
-- [Policy Syntax](https://docs.oracle.com/en-us/iaas/Content/Identity/Concepts/policysyntax.htm)
-
-## 測試
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-push 到 `main` 與每個 pull request 會由 GitHub Actions 在 Python 3.10、3.12、3.14 執行測試，並以 `shellcheck` 檢查 `setup.sh`。以 mock 取代 OCI client，不呼叫真實 API。涵蓋 AD 輪替、429 退避、額度停止、用量檢查、home region 檢查、成功路徑、建立後步驟失敗與續做、結果不明時的冪等保護、重複申請防護（申請前寫入 pending、token 過期、狀態目錄鎖）、網路中斷恢復、結束碼、設定解析、檔案權限、log 遮蔽與定期回報。
-
-## 相依套件
-
-- `requirements.in` 列出直接相依（`oci`）；`requirements.txt` 由它產生，固定所有間接相依的版本並附 hash，下載的檔案與 hash 不符時安裝會失敗。
-- 升級時修改 `requirements.in` 後重新產生：`pip install pip-tools && pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements.txt requirements.in`。
-- Dependabot 每週檢查 Python 相依套件與 GitHub Actions 的更新，並自動發 pull request。
+用專用的 IAM 使用者執行，不要用管理員帳號的 API 金鑰。使用者、群組、Policy 的建立步驟與每條語句的用途見 [docs/oracle-setup.md](docs/oracle-setup.md#6-建立-policy)。
 
 ## 已知限制
 
 - 用量檢查只看 `COMPARTMENT_ID` 與 `USAGE_EXTRA_COMPARTMENT_IDS` 指定的 compartment；免費額度以整個 tenancy 計算。
 - `STOPPED` 狀態的實例也計入用量（保守做法）。
-- 結果不明期間若刪除 `pending_launch.json`，冪等保護失效。
-- 「結果不明後以同一 token 重送、得到容量不足」視為原請求未建立，這是依 retry token 語意的推論，官方文件未逐字說明。
-- 建立成功後若寫入 `state.json` 失敗（例如磁碟已滿），會以結束碼 4 退出並通知；`pending_launch.json` 會保留，下次啟動以同一個 token 重送即可找回該實例。
+- 同一個 `STATE_DIR` 同時只允許一個程序申請。本機執行與 systemd 服務使用不同的 `STATE_DIR`，彼此無法偵測，不要同時執行。
+- 不要自行刪除 `pending_launch.json`，否則可能重複建立實例；只有程式要求人工確認、且已在主控台確認沒有多出實例時才刪除。
 - 續做模式下若實例已被終止，會持續以結束碼 4 結束，確認後需手動刪除 `state.json`。
 - 指派公網 IP 是否需要額外的 `public-ips` 權限尚未實測（要等實際建立成功才能確認）。
+
+## 開發
+
+運作流程、錯誤分類、冪等設計、測試與相依套件見 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
 ## 授權
 
