@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import logging
 import math
@@ -59,6 +61,7 @@ EXIT_INTERRUPTED = 130  # 收到 SIGINT / SIGTERM
 STATE_FILE = "state.json"
 RESULT_FILE = "result.json"
 PENDING_FILE = "pending_launch.json"
+LOCK_FILE = "claimer.lock"
 # opc-retry-token 有效 24 小時，保守扣 1 小時
 PENDING_TOKEN_TTL_SECONDS = 23 * 3600
 DRY_RUN_TIMEOUT_SECONDS = 120
@@ -620,6 +623,7 @@ class Claimer:
         rng: random.Random | None = None,
         token_factory: Callable[[], str] = new_retry_token,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ):
         self.s = settings
         self.c = clients
@@ -629,10 +633,14 @@ class Claimer:
         self.rng = rng or random.Random()
         self.token_factory = token_factory
         self.clock = clock
+        # pending 的 created_at 要跨程序比較，不能用 monotonic
+        self.wall_clock = wall_clock
+        self._pending_created_at: float | None = None
         self.compartment_id = settings.compartment_id or clients.tenancy_id
         self.state_path = Path(settings.state_dir).expanduser() / STATE_FILE
         self.result_path = Path(settings.state_dir).expanduser() / RESULT_FILE
         self.pending_path = Path(settings.state_dir).expanduser() / PENDING_FILE
+        self.lock_path = Path(settings.state_dir).expanduser() / LOCK_FILE
         self._rate_limit_streak = 0
         # 唯讀呼叫的預設時限；None 表示無限重試（正式執行），dry-run 會設定上限
         self.default_deadline: float | None = None
@@ -817,52 +825,62 @@ class Claimer:
 
     # ---- 建立實例 -------------------------------------------------------
 
-    def build_launch_details(self, ad: str, image_id: str, ssh_key: str):
+    def launch_spec(self, image_id: str) -> dict:
+        """申請內容中會隨時間或設定改變的部分；與 token 一起存進 pending，重送時沿用。"""
+        return {"image_id": image_id, "ocpus": self.s.ocpus, "memory_gb": self.s.memory_gb,
+                "boot_volume_gb": self.s.boot_volume_gb}
+
+    def build_launch_details(self, ad: str, spec: dict, ssh_key: str):
         m = oci.core.models
         return m.LaunchInstanceDetails(
             availability_domain=ad,
             compartment_id=self.compartment_id,
             display_name=self.s.display_name,
             shape=SHAPE,
-            shape_config=m.LaunchInstanceShapeConfigDetails(ocpus=self.s.ocpus, memory_in_gbs=self.s.memory_gb),
-            source_details=m.InstanceSourceViaImageDetails(image_id=image_id, boot_volume_size_in_gbs=self.s.boot_volume_gb),
+            shape_config=m.LaunchInstanceShapeConfigDetails(ocpus=spec["ocpus"], memory_in_gbs=spec["memory_gb"]),
+            source_details=m.InstanceSourceViaImageDetails(
+                image_id=spec["image_id"], boot_volume_size_in_gbs=spec["boot_volume_gb"]),
             create_vnic_details=m.CreateVnicDetails(subnet_id=self.s.subnet_id, assign_public_ip=self.s.assign_public_ip),
             metadata={"ssh_authorized_keys": ssh_key},
         )
 
-    def try_launch(self, ad: str, details, token: str | None = None, uncertain: bool = False):
-        """對單一 AD 嘗試建立；成功回傳 Instance，本輪放棄回傳 None。
+    def try_launch(self, ad: str, details, spec: dict, token: str | None = None, uncertain: bool = False):
+        """對單一 AD 嘗試建立；成功回傳 Instance，本 AD 放棄回傳 None。
 
-        冪等設計：
-          * 每次「新的嘗試」產生一個 opc_retry_token。
-          * 網路錯誤（沒拿到回應，不知道伺服器是否已建立）→ 這個 token 標記為「結果不明」。
-            從此只能用同一個 token、在同一個 AD 重送，直到拿到明確結果為止：
-            伺服器若已建立，重送會回傳同一個實例；若回容量不足 / 配額 / 權限等明確失敗，
-            代表先前的請求也沒有建立任何東西，才可以放棄這個 token。
-            期間遇到 429 或 5xx 只退避，不換 AD、不換 token。
-          * 「結果不明」的 token 會寫入 pending_launch.json；程式若在此期間被停止，
-            下次啟動會先用同一個 AD 與 token 重送，避免換新 token 造成重複建立。
-          * 未曾結果不明的 token：拿到明確失敗就換下一個 AD（下次嘗試換新 token）；
-            5xx 以同一 token 重試 TRANSIENT_MAX_ATTEMPTS_PER_AD 次後換 AD。
-          * 呼叫時明確傳 NoneRetryStrategy，避免 SDK 自動重試 429 干擾長退避；token 自行管理。
+        送出前先把 token 寫入 pending_launch.json，直到拿到明確結果才清除，因此送出後
+        任何中斷（網路錯誤、例外、程序被殺）都會在下次啟動以同一 AD、同一 token 重送。
+        結果不明期間 429 / 5xx / 可重試 409 只退避，不換 AD、不換 token；token 超過
+        PENDING_TOKEN_TTL_SECONDS 時拋 UncertainLaunchError。成功時不清 pending，
+        由呼叫端寫入 state.json 後清除。
         """
+        if token is None:
+            token = self.token_factory()
+            self.save_pending(ad, token, spec)
         try:
-            result = self._try_launch(ad, details, token, uncertain)
+            result = self._try_launch(ad, details, spec, token, uncertain)
         except (QuotaExhausted, ConfigError):
-            # 同一 token 重送拿到明確失敗：先前結果不明的請求也沒有建立任何東西
+            # 同一 token 拿到明確失敗：這個 token 沒有建立任何東西
             self.clear_pending()
             raise
-        # 走到這裡代表拿到明確結果。成功時由 run() 先寫 state.json 再清除 pending。
         if result is None:
             self.clear_pending()
         return result
 
-    def _try_launch(self, ad: str, details, token: str | None, uncertain: bool):
-        token = token or self.token_factory()
+    def _check_token_age(self, ad: str) -> None:
+        if self._pending_created_at is None:
+            return
+        if self.wall_clock() - self._pending_created_at > PENDING_TOKEN_TTL_SECONDS:
+            raise UncertainLaunchError(
+                f"[{ad}] 結果不明的申請持續超過 {PENDING_TOKEN_TTL_SECONDS // 3600} 小時，"
+                "retry token 已不保證冪等；請到主控台確認沒有多出的實例後刪除 pending_launch.json")
+
+    def _try_launch(self, ad: str, details, spec: dict, token: str, uncertain: bool):
         transient_failures = 0
         network_failures = 0
         while True:
             self._check_stop()
+            if uncertain:
+                self._check_token_age(ad)
             self.stats["attempts"] += 1
             try:
                 resp = self.c.compute.launch_instance(
@@ -877,6 +895,7 @@ class Claimer:
                             f"[{ad}] 結果不明的申請回傳 InvalidatedRetryToken，可能已建立過實例："
                             f"{describe_service_error(exc)}") from None
                     token = self.token_factory()
+                    self.save_pending(ad, token, spec)
                     log.warning("[%s] retry token 已失效，換新 token 重試", ad)
                     continue
                 kind = classify_service_error(exc)
@@ -914,9 +933,7 @@ class Claimer:
                             ad, describe_service_error(exc), delay)
                 self.sleep(delay)
             except NETWORK_ERRORS as exc:
-                if not uncertain:
-                    uncertain = True
-                    self.save_pending(ad, token)
+                uncertain = True
                 self.stats["network"] += 1
                 network_failures += 1
                 delay = self._transient_delay(network_failures)
@@ -925,30 +942,40 @@ class Claimer:
 
     # ---- 建立後步驟 -----------------------------------------------------
 
-    def save_pending(self, ad: str, token: str) -> None:
-        write_json_atomic(self.pending_path, {"availability_domain": ad, "token": token, "created_at": time.time()})
+    # ---- 建立後步驟 -----------------------------------------------------
+
+    def save_pending(self, ad: str, token: str, spec: dict) -> None:
+        self._pending_created_at = self.wall_clock()
+        write_json_atomic(self.pending_path, {
+            "availability_domain": ad, "token": token, "created_at": self._pending_created_at, "spec": spec})
 
     def clear_pending(self) -> None:
+        self._pending_created_at = None
         try:
             self.pending_path.unlink()
         except FileNotFoundError:
             pass
 
     def load_pending(self) -> dict | None:
+        """不存在回傳 None；內容不完整或 token 已超過 PENDING_TOKEN_TTL_SECONDS 時拋 StateFileError。"""
         try:
             pending = read_json(self.pending_path)
         except (OSError, ValueError) as exc:
             raise StateFileError(f"無法讀取 {self.pending_path}：{type(exc).__name__}") from None
         if pending is None:
             return None
-        if not pending.get("availability_domain") or not pending.get("token"):
+        if (not isinstance(pending, dict) or not pending.get("availability_domain") or not pending.get("token")
+                or not isinstance(pending.get("spec"), dict)):
             raise StateFileError(f"{self.pending_path} 內容不完整")
-        age = time.time() - float(pending.get("created_at", 0))
-        if age > PENDING_TOKEN_TTL_SECONDS:
-            # retry token 只保證 24 小時內有效，過期後重送無法保證冪等
+        try:
+            created_at = float(pending["created_at"])
+        except (KeyError, TypeError, ValueError):
+            raise StateFileError(f"{self.pending_path} 缺少有效的 created_at") from None
+        if self.wall_clock() - created_at > PENDING_TOKEN_TTL_SECONDS:
             raise StateFileError(
-                f"{self.pending_path} 已超過 24 小時，無法確認先前結果不明的申請是否成功；"
-                "請到主控台確認沒有多出的實例後刪除此檔")
+                f"{self.pending_path} 已超過 {PENDING_TOKEN_TTL_SECONDS // 3600} 小時，"
+                "無法確認先前結果不明的申請是否成功；請到主控台確認沒有多出的實例後刪除此檔")
+        self._pending_created_at = created_at
         return pending
 
     def save_state(self, instance, status: str = "launched") -> None:
@@ -1013,8 +1040,8 @@ class Claimer:
                 "region": self.c.region,
                 "availability_domain": inst.availability_domain,
                 "shape": SHAPE,
-                "ocpus": self.s.ocpus,
-                "memory_gb": self.s.memory_gb,
+                "ocpus": inst.shape_config.ocpus,
+                "memory_gb": inst.shape_config.memory_in_gbs,
                 "public_ip": public_ip,
                 "private_ip": private_ip,
                 "completed_at": utc_now(),
@@ -1058,7 +1085,25 @@ class Claimer:
         self.clear_pending()
         return self.finish(instance.id)
 
+    @contextlib.contextmanager
+    def _state_dir_lock(self):
+        """同一 STATE_DIR 只允許一個程序申請；拿不到鎖時拋 ConfigError。"""
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ConfigError(f"{self.lock_path.parent} 正由另一個 oci-a1-claimer 程序使用") from None
+            yield
+        finally:
+            os.close(fd)
+
     def run(self) -> int:
+        with self._state_dir_lock():
+            return self._run()
+
+    def _run(self) -> int:
         state = load_state(self.state_path)
         if state:
             if state.get("status") == "completed":
@@ -1071,13 +1116,14 @@ class Claimer:
         pending = self.load_pending()
         # 有結果不明的申請時，不做用量檢查：那台若已建立，檢查會誤判額度已滿而無法續做
         ads, image, ssh_key = self.prepare(check_usage=pending is None)
-        details_by_ad = {ad: self.build_launch_details(ad, image.id, ssh_key) for ad in ads}
+        spec = self.launch_spec(image.id)
+        details_by_ad = {ad: self.build_launch_details(ad, spec, ssh_key) for ad in ads}
 
         if pending:
-            ad = pending["availability_domain"]
-            log.warning("[%s] 發現結果不明的申請，以原 token 重送確認", ad)
-            details = details_by_ad.get(ad) or self.build_launch_details(ad, image.id, ssh_key)
-            instance = self.try_launch(ad, details, token=pending["token"], uncertain=True)
+            ad, pending_spec = pending["availability_domain"], pending["spec"]
+            log.warning("[%s] 發現結果不明的申請，以原 token 與原申請內容重送確認", ad)
+            details = self.build_launch_details(ad, pending_spec, ssh_key)
+            instance = self.try_launch(ad, details, pending_spec, token=pending["token"], uncertain=True)
             if instance is not None:
                 return self._on_launched(ad, instance)
             self.check_usage()
@@ -1087,7 +1133,7 @@ class Claimer:
             self.rounds += 1
             log.info("第 %d 輪，共 %d 個可用域", self.rounds, len(ads))
             for idx, ad in enumerate(ads):
-                instance = self.try_launch(ad, details_by_ad[ad])
+                instance = self.try_launch(ad, details_by_ad[ad], spec)
                 if instance is not None:
                     return self._on_launched(ad, instance)
                 if idx < len(ads) - 1:
@@ -1096,6 +1142,8 @@ class Claimer:
             delay = self.s.interval_seconds + self.rng.uniform(0, self.s.jitter_seconds)
             log.info("本輪無果，%.0f 秒後再試", delay)
             self.sleep(delay)
+
+    # ---- 定期回報 -------------------------------------------------------
 
     # ---- 定期回報 -------------------------------------------------------
 
@@ -1128,9 +1176,10 @@ class Claimer:
         if state:
             log.warning("[dry-run] 注意：%s 已存在（status=%s），正式執行時不會申請新實例；略過用量檢查",
                         self.state_path, state.get("status"))
-        if self.pending_path.exists():
-            log.warning("[dry-run] 注意：%s 存在，正式執行時會先以原 token 重送確認", self.pending_path)
-        ads, image, _ = self.prepare(check_usage=state is None)
+        has_pending = self.pending_path.exists()
+        if has_pending:
+            log.warning("[dry-run] 注意：%s 存在，正式執行時會先以原 token 重送確認；略過用量檢查", self.pending_path)
+        ads, image, _ = self.prepare(check_usage=state is None and not has_pending)
         log.info("[dry-run] 將以 %s %.1f OCPU / %.1f GB、開機磁碟 %d GB、公網 IP=%s 申請",
                  SHAPE, self.s.ocpus, self.s.memory_gb, self.s.boot_volume_gb, self.s.assign_public_ip)
         log.info("[dry-run] 映像檔：%s（%s）", image.display_name, image.id)
@@ -1160,6 +1209,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
     config_path = Path(args.config).expanduser()
     notifier = TelegramNotifier("", "")
+    claimer: Claimer | None = None
 
     try:
         settings = load_settings(config_path)
@@ -1187,6 +1237,9 @@ def main(argv: list[str] | None = None) -> int:
 
     except ConfigError as exc:
         log.error("設定錯誤：%s", exc)
+        if claimer is not None and claimer.started_at:
+            # 申請開始後才出現的設定錯誤（例如金鑰過期）不會重啟，需要主動通知
+            notifier.send(f"oci-a1-claimer 因設定錯誤停止：{exc}")
         return EXIT_CONFIG
     except QuotaExhausted as exc:
         log.error("停止：%s", exc)

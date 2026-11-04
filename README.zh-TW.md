@@ -78,7 +78,7 @@ log 持續出現「容量不足」與「本輪無果」是正常的，代表正�
 3. 對新 Bot 按「開始」並傳一則訊息，回到終端機按 Enter。
 4. 從列出的對話中選擇你自己的帳號。任何人都能私訊 Bot，因此腳本不會自動選擇。
 
-腳本會驗證 token、取得 chat id、發送測試訊息，並寫入 `config.env` 的 `TG_BOT_TOKEN`、`TG_CHAT_ID`。重新啟動 claimer 後生效。通知時機：開始申請時、每 `HEARTBEAT_HOURS` 小時回報一次進度（預設 24，設 `0` 關閉）、申請成功（附公網 IP）、額度已滿而停止、實例已建立但後續步驟失敗。定期回報沒有如期出現，代表程式已停止（例如主機進入睡眠）。
+腳本會驗證 token、取得 chat id、發送測試訊息，並寫入 `config.env` 的 `TG_BOT_TOKEN`、`TG_CHAT_ID`。重新啟動 claimer 後生效。通知時機：開始申請時、每 `HEARTBEAT_HOURS` 小時回報一次進度（預設 24，設 `0` 關閉）、申請成功（附公網 IP）、額度已滿而停止、實例已建立但後續步驟失敗、需要人工確認而停止（申請結果不明或狀態檔損毀）、開始申請後才發生的設定錯誤（例如 API 金鑰過期）。定期回報沒有如期出現，代表程式已停止（例如主機進入睡眠）。
 
 發送失敗時 log 會顯示 Telegram 的錯誤說明，例如 `chat not found`（chat id 錯誤）、`bot was blocked by the user`（已封鎖 Bot）。token 外洩時到 @BotFather 傳 `/revoke` 重新產生。
 
@@ -99,7 +99,7 @@ log 持續出現「容量不足」與「本輪無果」是正常的，代表正�
  │    ├─ launched  → 續做模式：只補做建立後步驟，不重新申請
  │    └─ 損毀      → 需人工確認，結束（4）
  ├─ 檢查 SSH 公鑰、home region、可用域、子網、映像檔
- ├─ pending_launch.json 存在？ → 先以原 AD + 原 token 重送，拿到明確結果才繼續
+ ├─ pending_launch.json 存在？ → 先以原 AD、原 token、原申請內容重送，拿到明確結果才繼續
  ├─ 用量檢查：已用 + 本次申請 > 上限 → 結束（3）
  └─ 迴圈：對每個 AD 呼叫 launch_instance
         容量不足  → 下一個 AD
@@ -131,7 +131,8 @@ log 持續出現「容量不足」與「本輪無果」是正常的，代表正�
 |---|---|
 | `state.json` | 建立成功當下立即寫入。存在時不會再申請；要再申請一台請先刪除 |
 | `result.json` | 最終結果：instance OCID、AD、公網 / 私有 IP |
-| `pending_launch.json` | 網路錯誤導致結果不明時的 AD 與 retry token；拿到明確結果後自動刪除 |
+| `pending_launch.json` | 進行中申請的 AD、retry token 與申請參數（映像檔、OCPU、記憶體、開機磁碟）；每次送出申請前寫入，拿到明確結果後刪除 |
+| `claimer.lock` | 空的鎖檔；同一個 `STATE_DIR` 同時只允許一個程序申請 |
 
 ### 錯誤分類
 
@@ -151,8 +152,10 @@ log 持續出現「容量不足」與「本輪無果」是正常的，代表正�
 ### 冪等設計
 
 - `launch_instance` 一律帶自行產生的 `opc_retry_token`，並在呼叫時傳 `NoneRetryStrategy()`，避免 SDK 自動重試 429 干擾長退避。
-- 網路錯誤後無法確定伺服器是否已建立，因此只用同一個 AD 和 token 重送：若已建立，伺服器會回傳同一台實例。這段期間遇到 429、5xx、409 只退避，不換 token；程式被停止時，下次啟動會先完成這個重送。
-- retry token 有效 24 小時；pending 超過 23 小時就停止並要求人工確認。
+- 每次呼叫 `launch_instance` 前，先把 AD、token 與申請參數寫入 `pending_launch.json`。呼叫因任何原因中斷（網路錯誤、非預期例外、程序被終止），下次啟動都會以同一個 AD、token 與參數重送：若已建立，伺服器會回傳同一台實例。
+- 結果不明期間遇到 429、5xx、可重試的 409 只退避，不換 token。409 `InvalidatedRetryToken` 代表先前的請求可能已建立實例，因此以結束碼 4 停止。
+- retry token 有效 24 小時；結果不明超過 23 小時（啟動時或重送期間）就以結束碼 4 停止並要求人工確認。
+- 同一個 `STATE_DIR` 同時只允許一個程序申請，第二個以結束碼 2 退出。不同 `STATE_DIR` 之間（例如本機執行與 systemd 服務）無法互相保護，不要同時執行。
 - 所有 client 明確停用 SDK 斷路器，避免連續的容量不足 500 讓後續呼叫被擋下。
 
 ## 以 systemd 長期執行
@@ -235,7 +238,7 @@ Allow group oci-a1-claimer to use virtual-network-family in compartment <network
 python -m unittest discover -s tests -v
 ```
 
-每次 push 與 pull request 會由 GitHub Actions 在 Python 3.10、3.12、3.14 執行測試，並以 `shellcheck` 檢查 `setup.sh`。以 mock 取代 OCI client，不呼叫真實 API。涵蓋 AD 輪替、429 退避、額度停止、用量檢查、home region 檢查、成功路徑、建立後步驟失敗與續做、結果不明時的冪等保護、網路中斷恢復、結束碼、設定解析、檔案權限、log 遮蔽與定期回報。
+每次 push 與 pull request 會由 GitHub Actions 在 Python 3.10、3.12、3.14 執行測試，並以 `shellcheck` 檢查 `setup.sh`。以 mock 取代 OCI client，不呼叫真實 API。涵蓋 AD 輪替、429 退避、額度停止、用量檢查、home region 檢查、成功路徑、建立後步驟失敗與續做、結果不明時的冪等保護、重複申請防護（申請前寫入 pending、token 過期、狀態目錄鎖）、網路中斷恢復、結束碼、設定解析、檔案權限、log 遮蔽與定期回報。
 
 ## 相依套件
 
@@ -247,9 +250,9 @@ python -m unittest discover -s tests -v
 
 - 用量檢查只看 `COMPARTMENT_ID` 與 `USAGE_EXTRA_COMPARTMENT_IDS` 指定的 compartment；免費額度以整個 tenancy 計算。
 - `STOPPED` 狀態的實例也計入用量（保守做法）。
-- 結果不明期間若刪除 `pending_launch.json` 或修改規格，冪等保護失效。
+- 結果不明期間若刪除 `pending_launch.json`，冪等保護失效。
 - 「結果不明後以同一 token 重送、得到容量不足」視為原請求未建立，這是依 retry token 語意的推論，官方文件未逐字說明。
-- 建立成功後若寫入 `state.json` 失敗（例如磁碟已滿），會以結束碼 4 退出並通知，但下次啟動不會知道該實例存在。
+- 建立成功後若寫入 `state.json` 失敗（例如磁碟已滿），會以結束碼 4 退出並通知；`pending_launch.json` 會保留，下次啟動以同一個 token 重送即可找回該實例。
 - 續做模式下若實例已被終止，會持續以結束碼 4 結束，確認後需手動刪除 `state.json`。
 - 指派公網 IP 是否需要額外的 `public-ips` 權限尚未實測（要等實際建立成功才能確認）。
 - Windows 上不檢查檔案權限，存取權限由資料夾 ACL 決定。

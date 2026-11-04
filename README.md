@@ -79,7 +79,7 @@ Follow the prompts:
 3. Press Start in the new bot's chat, send it any message, then press Enter in the terminal.
 4. Pick your own account from the listed chats. Anyone can message a bot, so the script never picks one automatically.
 
-The script verifies the token, finds the chat id, sends a test message, and writes `TG_BOT_TOKEN` and `TG_CHAT_ID` to `config.env`. Restart the claimer for it to take effect. Notifications are sent when claiming starts, every `HEARTBEAT_HOURS` hours with progress (default 24; `0` disables), when an instance is created (with its public IP), when the tool stops because the allowance is used up, and when the instance was created but a follow-up step failed. If the periodic report stops arriving, the tool is no longer running (for example, the host went to sleep).
+The script verifies the token, finds the chat id, sends a test message, and writes `TG_BOT_TOKEN` and `TG_CHAT_ID` to `config.env`. Restart the claimer for it to take effect. Notifications are sent when claiming starts, every `HEARTBEAT_HOURS` hours with progress (default 24; `0` disables), when an instance is created (with its public IP), when the tool stops because the allowance is used up, when the instance was created but a follow-up step failed, when it stops for a manual check (unknown launch outcome or damaged state file), and when a config error appears after claiming has started (for example, an expired API key). If the periodic report stops arriving, the tool is no longer running (for example, the host went to sleep).
 
 If sending fails, the log shows Telegram's error description, such as `chat not found` (wrong chat id) or `bot was blocked by the user`. If the token leaks, send `/revoke` to @BotFather to issue a new one.
 
@@ -100,7 +100,7 @@ start
  │    ├─ launched  → resume mode: finish post-launch steps only, never re-launch
  │    └─ corrupted → needs manual check, exit (4)
  ├─ check SSH key, home region, availability domains, subnet, image
- ├─ pending_launch.json exists? → resend with the same AD + token first, continue only on a definite result
+ ├─ pending_launch.json exists? → resend with the same AD, token, and request first, continue only on a definite result
  ├─ usage check: used + requested > limit → exit (3)
  └─ loop: call launch_instance for each AD
         out of capacity → next AD
@@ -132,7 +132,8 @@ All live in `STATE_DIR`, are written atomically, and have mode `0600`.
 |---|---|
 | `state.json` | Written the moment an instance is created. While it exists, no new launch is attempted; delete it to claim another instance |
 | `result.json` | Final result: instance OCID, AD, public / private IP |
-| `pending_launch.json` | AD and retry token when a network error leaves the outcome unknown; removed once a definite result arrives |
+| `pending_launch.json` | AD, retry token, and request parameters (image, OCPUs, memory, boot volume) of the launch in flight; written before each launch request and removed once a definite result arrives |
+| `claimer.lock` | Empty lock file; only one process may claim from a `STATE_DIR` at a time |
 
 ### Error classification
 
@@ -152,8 +153,10 @@ Based mainly on HTTP status and OCI error code, with the message as a fallback (
 ### Idempotency
 
 - Every `launch_instance` call carries a self-generated `opc_retry_token` and passes `NoneRetryStrategy()`, so the SDK does not auto-retry 429s and defeat the long backoff.
-- After a network error the server may or may not have created the instance, so the tool resends only with the same AD and token: if it was created, the server returns that same instance. Meanwhile 429, 5xx, and 409 only trigger backoff, never a new token; if the tool is stopped, the next start finishes this resend first.
-- Retry tokens are valid for 24 hours; a pending entry older than 23 hours stops the tool and asks for a manual check.
+- Before each `launch_instance` call the AD, token, and request parameters are written to `pending_launch.json`. If the call is interrupted in any way (network error, unexpected exception, the process being killed), the next start resends with the same AD, token, and parameters: if the instance was created, the server returns that same instance.
+- While the outcome is unknown, 429, 5xx, and retryable 409 only trigger backoff, never a new token. A 409 `InvalidatedRetryToken` means the earlier request may have created an instance, so the tool stops with exit code 4.
+- Retry tokens are valid for 24 hours; if the outcome is still unknown after 23 hours (at startup or while retrying), the tool stops with exit code 4 and asks for a manual check.
+- Only one process may claim from a `STATE_DIR` at a time; a second one exits with code 2. Runs with different `STATE_DIR`s (for example a local run and the systemd service) are not protected from each other, so do not run both.
 - The SDK circuit breaker is explicitly disabled on all clients, so consecutive out-of-capacity 500s do not block later calls.
 
 ## Running as a systemd service
@@ -236,7 +239,7 @@ References:
 python -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs the tests on Python 3.10, 3.12, and 3.14 plus `shellcheck` on every push and pull request. The OCI clients are mocked, so no real API calls are made. Covered: AD rotation, 429 backoff, quota stop, usage check, home region check, the success path, post-launch failures and resume, idempotency when the outcome is unknown, network recovery, exit codes, config parsing, file permissions, log redaction, and the periodic progress report.
+GitHub Actions runs the tests on Python 3.10, 3.12, and 3.14 plus `shellcheck` on every push and pull request. The OCI clients are mocked, so no real API calls are made. Covered: AD rotation, 429 backoff, quota stop, usage check, home region check, the success path, post-launch failures and resume, idempotency when the outcome is unknown, duplicate-launch guards (pending before launch, token expiry, state lock), network recovery, exit codes, config parsing, file permissions, log redaction, and the periodic progress report.
 
 ## Dependencies
 
@@ -248,9 +251,9 @@ GitHub Actions runs the tests on Python 3.10, 3.12, and 3.14 plus `shellcheck` o
 
 - The usage check only looks at `COMPARTMENT_ID` and `USAGE_EXTRA_COMPARTMENT_IDS`; the free allowance applies to the whole tenancy.
 - Instances in `STOPPED` state also count toward usage (conservative).
-- Deleting `pending_launch.json` or changing the shape while an outcome is unknown defeats the idempotency protection.
+- Deleting `pending_launch.json` while an outcome is unknown defeats the idempotency protection.
 - "Resending with the same token after an unknown outcome and getting out-of-capacity" is treated as "the original request created nothing". This follows from retry-token semantics but is not stated verbatim in Oracle's docs.
-- If writing `state.json` fails right after a successful launch (for example, disk full), the tool exits with code 4 and notifies you, but the next start will not know that instance exists.
+- If writing `state.json` fails right after a successful launch (for example, disk full), the tool exits with code 4 and notifies you; `pending_launch.json` is kept, so the next start resends with the same token and picks up that instance.
 - In resume mode, if the instance has been terminated, the tool keeps exiting with code 4; delete `state.json` manually after checking.
 - Whether assigning a public IP needs an extra `public-ips` permission is not yet verified (it can only be confirmed after a successful launch).
 - File permissions are not checked on Windows; access is governed by the folder's ACL.

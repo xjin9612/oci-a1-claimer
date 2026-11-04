@@ -53,6 +53,8 @@ def make_image(name, version, created_day=1):
     )
 
 
+SPEC_PENDING = {"image_id": "ocid1.image..old", "ocpus": 2.0, "memory_gb": 12.0, "boot_volume_gb": 50}
+
 # 規格與額度上限為必填設定；測試統一用這組值
 SPEC = dict(ocpus=2.0, memory_gb=12.0, free_ocpu_limit=2.0, free_memory_gb_limit=12.0)
 SPEC_ENV = {"OCPUS": "2", "MEMORY_GB": "12", "FREE_OCPU_LIMIT": "2", "FREE_MEMORY_GB_LIMIT": "12"}
@@ -72,6 +74,9 @@ class FakeSleeper:
 
     def clock(self):
         return self.now
+
+    def wall(self):
+        return 1_700_000_000 + self.now
 
 
 class ClaimerTestBase(unittest.TestCase):
@@ -117,7 +122,7 @@ class ClaimerTestBase(unittest.TestCase):
     def new_claimer(self):
         return claimer.Claimer(
             self.settings, self.clients, self.notifier, sleep_fn=self.sleeper,
-            token_factory=lambda: next(self.tokens), clock=self.sleeper.clock,
+            token_factory=lambda: next(self.tokens), clock=self.sleeper.clock, wall_clock=self.sleeper.wall,
         )
 
     @property
@@ -198,23 +203,50 @@ class TestLaunchLoop(ClaimerTestBase):
         self.assertFalse(self.state_path.exists())
 
     def test_existing_usage_blocks_before_launch(self):
-        """啟動前用量檢查：已有 4 OCPU / 24 GB 的 A1 實例 → 不呼叫 launch。"""
-        self.compute.list_instances.return_value = resp([
-            make_instance(id="old", lifecycle_state="RUNNING"),
-            make_instance(id="gone", lifecycle_state="TERMINATED"),
-        ])
-        with self.assertRaises(claimer.QuotaExhausted):
+        self.compute.list_instances.return_value = resp([make_instance(id="old", lifecycle_state="RUNNING")])
+        with self.assertRaisesRegex(claimer.QuotaExhausted, "已用滿"):
             self.claimer.run()
         self.compute.launch_instance.assert_not_called()
 
+    def test_terminated_and_other_shapes_not_counted(self):
+        self.compute.list_instances.return_value = resp([
+            make_instance(id="gone", lifecycle_state="TERMINATED"),
+            make_instance(id="going", lifecycle_state="TERMINATING"),
+            make_instance(id="x86", shape="VM.Standard.E2.1.Micro", lifecycle_state="RUNNING"),
+        ])
+        self.compute.launch_instance.return_value = resp(make_instance())
+        self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
+
+    def test_usage_counts_all_pages_and_extra_compartments(self):
+        """分頁與額外 compartment 都要加總，算少了會申請到付費實例。"""
+        half = SimpleNamespace(ocpus=1.0, memory_in_gbs=6.0)
+        self.settings.usage_extra_compartment_ids = ["ocid1.compartment.oc1..c", "ocid1.compartment.oc1..extra"]
+        pages = {
+            ("ocid1.compartment.oc1..c", None): resp([make_instance(id="p1", shape_config=half)], True, "pg2"),
+            ("ocid1.compartment.oc1..c", "pg2"): resp([make_instance(id="p2", shape_config=half)]),
+            ("ocid1.compartment.oc1..extra", None): resp([make_instance(id="e1", shape_config=half)]),
+        }
+        self.compute.list_instances.side_effect = lambda compartment_id, page=None, **_: pages[(compartment_id, page)]
+        used_cpu, used_mem, found = self.claimer.current_a1_usage()
+        self.assertEqual((used_cpu, used_mem), (3.0, 18.0))
+        self.assertEqual([i.id for i in found], ["p1", "p2", "e1"])  # 主 compartment 不重複計算
+
     def test_partial_usage_rejects_oversized_request(self):
+        """STOPPED 也計入；已用 1/6 + 申請 2/12 超過上限 2/12。"""
         self.compute.list_instances.return_value = resp([
             make_instance(id="old", lifecycle_state="STOPPED",
-                          shape_config=SimpleNamespace(ocpus=2.0, memory_in_gbs=12.0)),
+                          shape_config=SimpleNamespace(ocpus=1.0, memory_in_gbs=6.0)),
         ])
-        with self.assertRaises(claimer.QuotaExhausted):
+        with self.assertRaisesRegex(claimer.QuotaExhausted, "剩餘額度不足"):
             self.claimer.run()
         self.compute.launch_instance.assert_not_called()
+
+    def test_usage_exactly_at_limit_is_allowed(self):
+        self.settings.free_ocpu_limit, self.settings.free_memory_gb_limit = 3.0, 18.0
+        self.compute.list_instances.return_value = resp([
+            make_instance(id="old", shape_config=SimpleNamespace(ocpus=1.0, memory_in_gbs=6.0))])
+        self.compute.launch_instance.return_value = resp(make_instance())
+        self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
 
     def test_success_path_writes_files_and_notifies(self):
         self.compute.launch_instance.return_value = resp(make_instance())
@@ -227,6 +259,7 @@ class TestLaunchLoop(ClaimerTestBase):
         result = json.loads(self.result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["public_ip"], "203.0.113.10")
         self.assertEqual(result["instance_id"], "ocid1.instance.oc1..new")
+        self.assertEqual((result["ocpus"], result["memory_gb"]), (4.0, 24.0))  # 取自實例，不是設定
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "completed")
         if os.name == "posix":
@@ -348,24 +381,50 @@ class TestLaunchLoop(ClaimerTestBase):
 class TestMainExitCodes(unittest.TestCase):
     """main() 把例外轉成正確的結束碼。"""
 
-    def _run_main_with(self, exc):
-        fake = mock.MagicMock()
+    def _run_main_with(self, exc, started_at=""):
+        fake = mock.MagicMock(started_at=started_at)
         fake.run.side_effect = exc
+        self.sent = []
         with mock.patch.object(claimer, "load_settings", return_value=mock.MagicMock(
-                tg_bot_token="", tg_chat_id="", log_level="INFO")), \
+                tg_bot_token="tok", tg_chat_id="1", log_level="INFO")), \
+             mock.patch.object(claimer.TelegramNotifier, "send", lambda _self, t: self.sent.append(t)), \
              mock.patch.object(claimer, "build_clients", return_value=(mock.MagicMock(), {})), \
              mock.patch.object(claimer, "Claimer", return_value=fake), \
              mock.patch.object(claimer, "check_file_permissions"), \
              mock.patch.object(claimer, "setup_logging"), \
-             mock.patch.object(claimer.signal, "signal"):
-            with self.assertLogs("oci-a1-claimer", level="ERROR"):
-                return claimer.main(["-c", "nonexistent.env"])
+             mock.patch.object(claimer.signal, "signal"), \
+             mock.patch.object(claimer, "log"):
+            return claimer.main(["-c", "nonexistent.env"])
 
     def test_codes(self):
-        self.assertEqual(self._run_main_with(claimer.ConfigError("x")), claimer.EXIT_CONFIG)
-        self.assertEqual(self._run_main_with(claimer.QuotaExhausted("x")), claimer.EXIT_QUOTA)
-        self.assertEqual(self._run_main_with(claimer.PostLaunchError("id", "x")), claimer.EXIT_POST_LAUNCH)
-        self.assertEqual(self._run_main_with(RuntimeError("x")), claimer.EXIT_UNEXPECTED)
+        cases = [
+            (claimer.ConfigError("x"), claimer.EXIT_CONFIG),
+            (claimer.QuotaExhausted("x"), claimer.EXIT_QUOTA),
+            (claimer.PostLaunchError("id", "x"), claimer.EXIT_POST_LAUNCH),
+            (claimer.StateFileError("x"), claimer.EXIT_POST_LAUNCH),
+            (claimer.UncertainLaunchError("x"), claimer.EXIT_POST_LAUNCH),
+            (TimeoutError("x"), claimer.EXIT_UNEXPECTED),
+            (claimer.Interrupted(), claimer.EXIT_INTERRUPTED),
+            (KeyboardInterrupt(), claimer.EXIT_INTERRUPTED),
+            (RuntimeError("x"), claimer.EXIT_UNEXPECTED),
+        ]
+        for exc, code in cases:
+            with self.subTest(exc=type(exc).__name__):
+                self.assertEqual(self._run_main_with(exc), code)
+
+    def test_stops_that_need_attention_notify(self):
+        for exc in (claimer.QuotaExhausted("x"), claimer.PostLaunchError("id", "x"),
+                    claimer.StateFileError("x"), claimer.UncertainLaunchError("x")):
+            with self.subTest(exc=type(exc).__name__):
+                self._run_main_with(exc)
+                self.assertEqual(len(self.sent), 1)
+
+    def test_config_error_notifies_only_after_claiming_started(self):
+        self._run_main_with(claimer.ConfigError("401 NotAuthenticated"))
+        self.assertEqual(self.sent, [])  # 啟動時的設定錯誤：使用者就在現場
+        self._run_main_with(claimer.ConfigError("401 NotAuthenticated"), started_at="2026-11-04 10:00 +0800")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("401 NotAuthenticated", self.sent[0])
 
 
 class TestImagePicking(unittest.TestCase):
@@ -426,7 +485,6 @@ class TestConfigAndFiles(unittest.TestCase):
             claimer.load_settings(None, environ={"SUBNET_ID": "x", "SSH_PUBLIC_KEY_FILE": "k", **SPEC_ENV,
                                                  "ASSIGN_PUBLIC_IP": "maybe"})
 
-    @unittest.skipUnless(os.name == "posix", "權限檢查只在 POSIX 上有意義")
     def test_permission_warning(self):
         f = self.dir / "config.env"
         f.write_text("X=1")
@@ -491,7 +549,9 @@ class TestHeartbeat(ClaimerTestBase):
         self.compute.launch_instance.side_effect = [capacity_error()] * 20 + [resp(make_instance())]
         self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
         beats = [m for m in self._messages() if "仍在執行" in m]
-        self.assertGreaterEqual(len(beats), 1)
+        # 6 分鐘間隔、每輪 61~71 秒、共 10 輪：恰好回報一次，且帶當下累計次數
+        self.assertEqual(len(beats), 1)
+        self.assertRegex(beats[0], r"已嘗試 1[0-9] 次")
         self.assertIn("容量不足", beats[0])
         self.assertEqual(self.claimer.stats["attempts"], 21)
         self.assertEqual(self.claimer.stats["capacity"], 20)
@@ -538,7 +598,7 @@ class TestUncertainLaunch(ClaimerTestBase):
         def stop_on_sleep(_seconds):
             raise claimer.Interrupted()
         c1 = claimer.Claimer(self.settings, self.clients, self.notifier, sleep_fn=stop_on_sleep,
-                             token_factory=lambda: next(self.tokens))
+                             token_factory=lambda: next(self.tokens), wall_clock=self.sleeper.wall)
         self.compute.launch_instance.side_effect = [oci.exceptions.ConnectTimeout("t")]
         with self.assertRaises(claimer.Interrupted):
             c1.run()
@@ -565,8 +625,8 @@ class TestUncertainLaunch(ClaimerTestBase):
 
     def test_expired_pending_requires_manual_check(self):
         claimer.write_json_atomic(self.claimer.pending_path, {
-            "availability_domain": "AD-1", "token": "old", "created_at": 0})
-        with self.assertRaises(claimer.StateFileError):
+            "availability_domain": "AD-1", "token": "old", "created_at": 0, "spec": SPEC_PENDING})
+        with self.assertRaisesRegex(claimer.StateFileError, "已超過"):
             self.claimer.run()
         self.compute.launch_instance.assert_not_called()
 
@@ -586,6 +646,93 @@ class TestUncertainLaunch(ClaimerTestBase):
         ]
         self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
         self.assertEqual([t for _, t in self._calls()], ["token0", "token1"])
+
+
+class TestDuplicateLaunchGuards(ClaimerTestBase):
+    """任何中斷都不能讓同一次申請換新 token 重送。"""
+
+    def _write_pending(self, **overrides):
+        data = {"availability_domain": "xyz:AP-TOKYO-1-AD-1", "token": "old",
+                "created_at": self.sleeper.wall(), "spec": SPEC_PENDING, **overrides}
+        claimer.write_json_atomic(self.claimer.pending_path, data)
+
+    def test_pending_written_before_launch_and_kept_on_unexpected_error(self):
+        """回應解析失敗等非網路例外：送出前已寫入的 pending 保留，重啟以同一 token 重送。"""
+        seen = []
+
+        def launch(details, **kw):
+            seen.append(json.loads(self.claimer.pending_path.read_text())["token"])
+            raise ValueError("cannot deserialize response")
+
+        self.compute.launch_instance.side_effect = launch
+        with self.assertRaises(ValueError):
+            self.claimer.run()
+        self.assertEqual(seen, ["token0"])
+        self.assertEqual(json.loads(self.claimer.pending_path.read_text())["token"], "token0")
+
+        self.compute.launch_instance.side_effect = [resp(make_instance())]
+        self.assertEqual(self.new_claimer().run(), claimer.EXIT_OK)
+        self.assertEqual(self.compute.launch_instance.call_args.kwargs["opc_retry_token"], "token0")
+        self.assertFalse(self.claimer.pending_path.exists())
+
+    def test_definite_result_clears_pending(self):
+        self.compute.launch_instance.side_effect = [capacity_error(), resp(make_instance())]
+        self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
+        self.assertFalse(self.claimer.pending_path.exists())
+
+    def test_resume_resends_stored_spec_not_current_image(self):
+        """重啟期間出了新映像檔：重送仍用 pending 記錄的映像檔與規格。"""
+        self._write_pending()
+        self.compute.list_images.return_value = resp([make_image("Canonical-Ubuntu-24.04-new", "24.04", 9)])
+        self.compute.launch_instance.return_value = resp(make_instance())
+        self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
+        details = self.compute.launch_instance.call_args.args[0]
+        self.assertEqual(details.source_details.image_id, "ocid1.image..old")
+        self.assertEqual(self.compute.launch_instance.call_args.kwargs["opc_retry_token"], "old")
+
+    def test_uncertain_retry_stops_when_token_expires(self):
+        """結果不明期間持續斷線：超過 token 有效期就停止並保留 pending，不再重送。"""
+        self.compute.launch_instance.side_effect = (oci.exceptions.RequestException("down") for _ in iter(int, 1))
+        with self.assertRaises(claimer.UncertainLaunchError):
+            self.claimer.run()
+        self.assertGreater(self.sleeper.now, claimer.PENDING_TOKEN_TTL_SECONDS)
+        self.assertLess(self.sleeper.now, claimer.PENDING_TOKEN_TTL_SECONDS + 2 * self.settings.transient_retry_max_seconds)
+        self.assertTrue(self.claimer.pending_path.exists())
+
+    def test_bad_pending_needs_manual_check(self):
+        cases = {
+            "not a dict": [1, 2],
+            "missing spec": {"availability_domain": "AD-1", "token": "t", "created_at": self.sleeper.wall()},
+            "bad created_at": {"availability_domain": "AD-1", "token": "t", "created_at": "x", "spec": SPEC_PENDING},
+        }
+        for name, data in cases.items():
+            with self.subTest(name):
+                claimer.write_json_atomic(self.claimer.pending_path, data)
+                with self.assertRaises(claimer.StateFileError):
+                    self.claimer.run()
+        self.compute.launch_instance.assert_not_called()
+
+    def test_save_state_failure_keeps_pending(self):
+        """建立成功但寫 state 失敗：以結束碼 4 停止，pending 保留讓重啟能以原 token 找回同一台。"""
+        self.compute.launch_instance.return_value = resp(make_instance())
+        with mock.patch.object(self.claimer, "save_state", side_effect=OSError("disk full")), \
+             self.assertRaises(claimer.PostLaunchError):
+            self.claimer.run()
+        self.assertEqual(json.loads(self.claimer.pending_path.read_text())["token"], "token0")
+
+    def test_second_process_on_same_state_dir_is_refused(self):
+        with self.new_claimer()._state_dir_lock():
+            with self.assertRaisesRegex(claimer.ConfigError, "另一個"):
+                self.claimer.run()
+        self.compute.launch_instance.assert_not_called()
+        self.compute.launch_instance.return_value = resp(make_instance())
+        self.assertEqual(self.claimer.run(), claimer.EXIT_OK)  # 鎖釋放後可正常執行
+
+    def test_dry_run_with_pending_skips_usage_check(self):
+        """先前結果不明的那台可能已建立；dry-run 與正式執行一樣略過用量檢查。"""
+        self._write_pending()
+        self.compute.list_instances.return_value = resp([make_instance(lifecycle_state="RUNNING")])
+        self.assertEqual(self.claimer.dry_run(), claimer.EXIT_OK)
 
 
 class TestPostLaunchResilience(ClaimerTestBase):

@@ -214,9 +214,13 @@ print("[資訊] 已發送測試訊息，請確認 Telegram 有收到")
 
 text = config.read_text(encoding="utf-8")
 for key, value in (("TG_BOT_TOKEN", token), ("TG_CHAT_ID", str(chat["id"]))):
-    pattern = re.compile(rf"^[ \t]*#?[ \t]*{key}[ \t]*=.*$", re.M)
     line = f"{key}={value}"
-    text, n = pattern.subn(lambda _m: line, text, count=1)
+    # 生效的是最後一個未註解的行，因此全部改寫；沒有才啟用註解掉的範本行，再沒有就附加
+    active = re.compile(rf"^[ \t]*(export[ \t]+)?{key}[ \t]*=.*$", re.M)
+    text, n = active.subn(lambda _m: line, text)
+    if not n:
+        commented = re.compile(rf"^[ \t]*#[ \t]*{key}[ \t]*=.*$", re.M)
+        text, n = commented.subn(lambda _m: line, text, count=1)
     if not n:
         text = text.rstrip("\n") + f"\n{line}\n"
 config.write_text(text, encoding="utf-8")
