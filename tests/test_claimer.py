@@ -685,7 +685,8 @@ class TestDuplicateLaunchGuards(ClaimerTestBase):
 
     def test_uncertain_retry_stops_when_token_expires(self):
         """結果不明期間持續斷線：超過 token 有效期就停止並保留 pending，不再重送。"""
-        self.compute.launch_instance.side_effect = (oci.exceptions.RequestException("down") for _ in iter(int, 1))
+        # 有限次數：過期檢查失效時以 StopIteration 失敗，而不是無限重送卡住 CI
+        self.compute.launch_instance.side_effect = [oci.exceptions.RequestException("down")] * 2000
         with self.assertRaises(claimer.UncertainLaunchError):
             self.claimer.run()
         self.assertGreater(self.sleeper.now, claimer.PENDING_TOKEN_TTL_SECONDS)
