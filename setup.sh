@@ -31,9 +31,10 @@ info()  { printf '\033[32m[資訊]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[33m[警告]\033[0m %s\n' "$*" >&2; }
 die()   { printf '\033[31m[錯誤]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# 印出檔頭第 2–16 行；改檔頭時須同步行號
 usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-# 讀取 KEY=VALUE 檔中最後一個 KEY 的值（去除前後引號）
+# 讀取 KEY=VALUE 檔中最後一個 KEY 的值（去除前後引號）；不處理 export 前綴
 env_value() {
     local key=$1 file=$2
     sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$file" | tail -n 1 | sed "s/^[\"']//; s/[\"']$//"
@@ -104,9 +105,6 @@ check_project_files() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# 本機安裝
-# ---------------------------------------------------------------------------
 install_local() {
     cd "$PROJECT_DIR"
     if grep -qi microsoft /proc/version 2>/dev/null && [[ "$PROJECT_DIR" == /mnt/[a-z]/* ]]; then
@@ -142,9 +140,6 @@ install_local() {
     info "長期執行：sudo ./setup.sh --systemd"
 }
 
-# ---------------------------------------------------------------------------
-# Telegram 通知設定
-# ---------------------------------------------------------------------------
 setup_telegram() {
     cd "$PROJECT_DIR"
     [[ -f config.env ]] || die "找不到 config.env，請先執行 ./setup.sh"
@@ -235,9 +230,6 @@ PY
     fi
 }
 
-# ---------------------------------------------------------------------------
-# systemd 安裝 / 移除
-# ---------------------------------------------------------------------------
 require_root_systemd() {
     [[ $EUID -eq 0 ]] || die "此模式需要 root，請用 sudo 執行"
     [[ -d /run/systemd/system ]] ||
@@ -249,7 +241,7 @@ same_content() {
     cmp -s <(grep -v '^[[:space:]]*key_file[[:space:]]*=' "$1") <(grep -v '^[[:space:]]*key_file[[:space:]]*=' "$2")
 }
 
-# 安裝單一設定檔：不存在才安裝；已存在且內容不同時保留舊檔並提示
+# dst 不存在或指定 --update-config 時安裝（root:SVC_USER 640）；否則保留 dst，內容不同時提示
 install_conf() {
     local src=$1 dst=$2 update=$3
     if [[ -f "$dst" && $update -eq 0 ]]; then

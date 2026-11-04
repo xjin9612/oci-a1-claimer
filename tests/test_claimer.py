@@ -5,7 +5,6 @@
 
 import io
 import json
-import os
 import stat
 import sys
 import tempfile
@@ -160,7 +159,6 @@ class TestErrorClassification(unittest.TestCase):
 
 class TestLaunchLoop(ClaimerTestBase):
     def test_capacity_rotates_ads_then_sleeps_round(self):
-        """容量不足：輪替所有 AD，整輪結束後 sleep（含 jitter），下一輪成功。"""
         self.compute.launch_instance.side_effect = [
             capacity_error(), capacity_error(),          # 第 1 輪兩個 AD 都沒貨
             capacity_error(), resp(make_instance()),      # 第 2 輪 AD-2 成功
@@ -181,7 +179,6 @@ class TestLaunchLoop(ClaimerTestBase):
         self.assertLessEqual(round_sleeps[0], self.settings.interval_seconds + self.settings.jitter_seconds)
 
     def test_rate_limit_long_backoff_and_escalation(self):
-        """429：長退避，連續 429 時加倍（有上限）。"""
         self.compute.launch_instance.side_effect = [
             service_error(429, "TooManyRequests"),
             service_error(429, "TooManyRequests"),
@@ -262,9 +259,8 @@ class TestLaunchLoop(ClaimerTestBase):
         self.assertEqual((result["ocpus"], result["memory_gb"]), (4.0, 24.0))  # 取自實例，不是設定
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "completed")
-        if os.name == "posix":
-            self.assertEqual(stat.S_IMODE(self.result_path.stat().st_mode), 0o600)
-            self.assertEqual(stat.S_IMODE(self.state_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.result_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.state_path.stat().st_mode), 0o600)
         # 開始通知 + 成功通知
         self.assertEqual(self.notifier.send.call_count, 2)
         self.assertIn("開始申請", self.notifier.send.call_args_list[0].args[0])
@@ -365,7 +361,6 @@ class TestLaunchLoop(ClaimerTestBase):
         self.assertEqual(self.claimer.run(), claimer.EXIT_OK)
 
     def test_dry_run_network_failure_times_out(self):
-        """dry-run 網路不通時在時限內結束，不無限重試。"""
         self.identity.list_region_subscriptions.side_effect = oci.exceptions.RequestException("down")
         with self.assertRaises(TimeoutError):
             self.claimer.dry_run()
@@ -379,8 +374,6 @@ class TestLaunchLoop(ClaimerTestBase):
 
 
 class TestMainExitCodes(unittest.TestCase):
-    """main() 把例外轉成正確的結束碼。"""
-
     def _run_main_with(self, exc, started_at=""):
         fake = mock.MagicMock(started_at=started_at)
         fake.run.side_effect = exc
@@ -388,7 +381,7 @@ class TestMainExitCodes(unittest.TestCase):
         with mock.patch.object(claimer, "load_settings", return_value=mock.MagicMock(
                 tg_bot_token="tok", tg_chat_id="1", log_level="INFO")), \
              mock.patch.object(claimer.TelegramNotifier, "send", lambda _self, t: self.sent.append(t)), \
-             mock.patch.object(claimer, "build_clients", return_value=(mock.MagicMock(), {})), \
+             mock.patch.object(claimer, "build_clients", return_value=mock.MagicMock()), \
              mock.patch.object(claimer, "Claimer", return_value=fake), \
              mock.patch.object(claimer, "check_file_permissions"), \
              mock.patch.object(claimer, "setup_logging"), \
@@ -788,9 +781,8 @@ class TestBuildClients(unittest.TestCase):
              mock.patch.object(claimer.oci.core, "ComputeClient"), \
              mock.patch.object(claimer.oci.core, "VirtualNetworkClient"), \
              mock.patch.object(claimer.oci.identity, "IdentityClient"):
-            clients, cfg = claimer.build_clients(s)
+            clients = claimer.build_clients(s)
         self.assertEqual(clients.region, "ap-osaka-1")
-        self.assertEqual(cfg["region"], "ap-osaka-1")
 
     def test_missing_config_file_is_config_error(self):
         s = claimer.Settings(subnet_id="s", ssh_public_key_file="k", oci_config_file="/nonexistent/cfg", **SPEC)
@@ -805,7 +797,7 @@ class TestMainNotifications(unittest.TestCase):
         sent = []
         settings = mock.MagicMock(tg_bot_token="tok", tg_chat_id="1", log_level="INFO")
         with mock.patch.object(claimer, "load_settings", return_value=settings), \
-             mock.patch.object(claimer, "build_clients", return_value=(mock.MagicMock(), {})), \
+             mock.patch.object(claimer, "build_clients", return_value=mock.MagicMock()), \
              mock.patch.object(claimer, "Claimer", return_value=fake), \
              mock.patch.object(claimer, "check_file_permissions"), \
              mock.patch.object(claimer, "setup_logging"), \
@@ -842,7 +834,6 @@ class TestConfigValidation(unittest.TestCase):
             self.assertEqual(Path(s.state_dir), base / "state")
             self.assertEqual(Path(s.ssh_public_key_file), base / "k.pub")
 
-    @unittest.skipUnless(os.name == "posix", "權限檢查只在 POSIX 上有意義")
     def test_group_read_allowed_other_read_warned(self):
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "k"

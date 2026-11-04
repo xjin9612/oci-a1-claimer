@@ -1,15 +1,15 @@
 # Oracle Cloud 帳號與主控台準備
 
-從註冊 Oracle Cloud 到取得本工具所需的三個檔案（`oci_config`、`oci_api_key.pem`、子網 OCID）的完整流程。選單名稱以繁體中文主控台為準，括號內為英文介面名稱；Oracle 改版後位置可能略有不同。
+從註冊 Oracle Cloud 到取得本工具所需資料（`oci_config`、`oci_api_key.pem`、`ssh.pub` 與子網 OCID）的完整流程。選單名稱以繁體中文主控台為準，括號內為英文介面名稱；Oracle 改版後位置可能略有不同。
 
-完成後回到 [README](../README.md) 的「快速開始」。
+完成後回到 [README 的「快速開始」](../README.zh-TW.md#快速開始)。
 
 ## 準備
 
 - **Email**：一個 Email 只能建立一個帳號。
 - **手機號碼**：需可接聽電話，Oracle 可能來電確認。
 - **信用卡**：只接受 **Visa、Mastercard、American Express**，**JCB 不可用**。具備 Visa / Mastercard 標誌、不需 PIN 碼的簽帳金融卡也可以。卡片需開啟海外網路交易。註冊時只做暫時的驗證預扣，不升級成付費帳號不會收費。
-- **規定**：每人只能有一個免費帳號，建立多個帳號會被停用或終止。
+- **規定**：每人只能有一個免費帳號，建立多個帳號會被停用或終止（[Free Tier FAQ](https://www.oracle.com/cloud/free/faq/)）。
 
 ## 1. 註冊
 
@@ -27,7 +27,7 @@
 | 雲端帳戶名稱 | 自訂，登入時要用，記下來 |
 | 原建立區域（Home Region） | **Japan East (Tokyo)**，見下方說明 |
 
-**原建立區域註冊後永遠無法更改。** Always Free 的運算實例只能建在這個區域。台灣沒有 OCI 區域，從台灣使用建議選東京或大阪；南韓北部（春川）無法建立 Always Free A1 實例。這個選項只決定機房位置，與你的地址無關。
+**原建立區域註冊後永遠無法更改。** Always Free 的運算實例只能建在這個區域。台灣沒有 OCI 區域，從台灣使用建議選東京或大阪；南韓北部（春川）無法建立 Always Free A1 實例（[Always Free Resources](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm)）。這個選項只決定機房位置，與你的地址無關。
 
 ### 地址資訊
 
@@ -118,7 +118,7 @@ Allow group oci-a1-claimer to use subnets in tenancy
 Allow group oci-a1-claimer to use network-security-groups in tenancy
 ```
 
-群組位於 Default 網域時可省略網域名稱（[Policy Subjects](https://docs.oracle.com/en-us/iaas/Content/Identity/policysyntax/subject.htm)）。以上範圍為整個租用戶；要進一步縮小，可另建區間放 VCN 與實例，把 `tenancy` 換成 `compartment <名稱>`。各語句用途見 README「最小權限 IAM」。
+群組位於 Default 網域時可省略網域名稱（[Policy Subjects](https://docs.oracle.com/en-us/iaas/Content/Identity/policysyntax/subject.htm)）。以上範圍為整個租用戶；要進一步縮小，可另建區間放 VCN 與實例，把 `tenancy` 換成 `compartment <名稱>`。各語句用途見 [README 的「最小權限 IAM」](../README.zh-TW.md#最小權限-iam)。
 
 ## 7. 產生 API Key
 

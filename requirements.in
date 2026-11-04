@@ -1,2 +1,2 @@
-# 直接相依；修改後執行 pip-compile --generate-hashes --strip-extras requirements.in 產生 requirements.txt
+# 直接相依；修改後執行 pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements.txt requirements.in
 oci==2.189.0

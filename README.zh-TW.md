@@ -18,7 +18,7 @@
 ## 開始前須知
 
 - **免費額度以官方為準**：見 [Always Free Resources](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm) 與主控台 Governance → Limits, Quotas and Usage。規格（`OCPUS`、`MEMORY_GB`）與額度上限（`FREE_OCPU_LIMIT`、`FREE_MEMORY_GB_LIMIT`）都是 `config.env` 的必填項，程式內沒有預設值，政策變動時只需改設定。
-- **Home region**：Always Free 運算實例只能建在 home region，且 home region 註冊後無法更改（[Managing Regions](https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/managingregions.htm)）。本工具啟動時會檢查目標 region 是否為 home region，不是就拒絕執行。
+- **Home region**：Always Free 運算實例只能建在 home region，且 home region 註冊後無法更改（[Managing Regions](https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/managingregions.htm)）。本工具啟動時會檢查目標 region 是否為 home region，不是就拒絕執行（設 `REQUIRE_HOME_REGION=false` 時只警告）。
 - **帳號類型**：
   - 免費帳號超過免費額度時，A1 實例會被停用並刪除。
   - PAYG（隨用隨付）帳號超出免費額度的部分**會計費**。請確認 `OCPUS` / `MEMORY_GB` 不超過你帳號的免費額度。
@@ -144,7 +144,7 @@ log 持續出現「容量不足」與「本輪無果」是正常的，代表正�
 | `LimitExceeded` / `QuotaExceeded` | 額度不足 |
 | 5xx 且訊息含 `capacity` | 容量不足 |
 | 其他 5xx；409 `IncorrectState` / `ExternalServerIncorrectState` / `LockConflict` | 暫時性錯誤 |
-| 其他 400、401、403、404、409 | 設定錯誤 |
+| 其他 4xx | 設定錯誤 |
 | `oci.exceptions.RequestException` / `ConnectTimeout`、`ConnectionError`、`TimeoutError` | 網路錯誤 |
 
 容量不足不在官方錯誤表內，實際回應為 `500 / InternalError / "Out of host capacity."`。訊息格式若改變，會被當成暫時性錯誤退避重試，不會中斷。
@@ -181,7 +181,7 @@ sudo cat /var/lib/oci-a1-claimer/result.json
 - 服務以專用的非 root 使用者 `oci-claimer` 執行，並啟用 `NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp` 等強化選項；log 寫到 journald。
 - 設定與金鑰由 root 擁有、服務群組唯讀，服務無法改寫自己的設定。
 - `RestartPreventExitStatus=2 3 4`：只有未預期錯誤會自動重啟。
-- 安裝前會以服務使用者執行一次 dry-run，失敗就不安裝。
+- 程式與設定複製到 `/opt`、`/etc` 後，以服務使用者執行一次 dry-run；失敗就不安裝、不啟動服務。
 - 重複執行不會覆蓋 `/etc` 內已存在的設定；內容不同時會提示，要覆蓋請加 `--update-config`。
 - `config.env` 須使用預設的 `secrets/` 路徑。Telegram token 等機密放在 `config.env`，不要寫進 unit 的 `Environment=`。
 - WSL 需先在 `/etc/wsl.conf` 設定 `[boot]` 下的 `systemd=true` 並重啟 WSL。
@@ -238,7 +238,7 @@ Allow group oci-a1-claimer to use virtual-network-family in compartment <network
 python -m unittest discover -s tests -v
 ```
 
-每次 push 與 pull request 會由 GitHub Actions 在 Python 3.10、3.12、3.14 執行測試，並以 `shellcheck` 檢查 `setup.sh`。以 mock 取代 OCI client，不呼叫真實 API。涵蓋 AD 輪替、429 退避、額度停止、用量檢查、home region 檢查、成功路徑、建立後步驟失敗與續做、結果不明時的冪等保護、重複申請防護（申請前寫入 pending、token 過期、狀態目錄鎖）、網路中斷恢復、結束碼、設定解析、檔案權限、log 遮蔽與定期回報。
+push 到 `main` 與每個 pull request 會由 GitHub Actions 在 Python 3.10、3.12、3.14 執行測試，並以 `shellcheck` 檢查 `setup.sh`。以 mock 取代 OCI client，不呼叫真實 API。涵蓋 AD 輪替、429 退避、額度停止、用量檢查、home region 檢查、成功路徑、建立後步驟失敗與續做、結果不明時的冪等保護、重複申請防護（申請前寫入 pending、token 過期、狀態目錄鎖）、網路中斷恢復、結束碼、設定解析、檔案權限、log 遮蔽與定期回報。
 
 ## 相依套件
 
@@ -255,7 +255,6 @@ python -m unittest discover -s tests -v
 - 建立成功後若寫入 `state.json` 失敗（例如磁碟已滿），會以結束碼 4 退出並通知；`pending_launch.json` 會保留，下次啟動以同一個 token 重送即可找回該實例。
 - 續做模式下若實例已被終止，會持續以結束碼 4 結束，確認後需手動刪除 `state.json`。
 - 指派公網 IP 是否需要額外的 `public-ips` 權限尚未實測（要等實際建立成功才能確認）。
-- Windows 上不檢查檔案權限，存取權限由資料夾 ACL 決定。
 
 ## 授權
 

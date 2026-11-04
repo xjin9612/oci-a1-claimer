@@ -19,7 +19,7 @@ Keeps requesting an OCI Always Free `VM.Standard.A1.Flex` (ARM) instance through
 ## Before you start
 
 - **The official free allowance is the source of truth**: see [Always Free Resources](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm) and Console → Governance → Limits, Quotas and Usage. Shape size (`OCPUS`, `MEMORY_GB`) and allowance limits (`FREE_OCPU_LIMIT`, `FREE_MEMORY_GB_LIMIT`) are required in `config.env` and have no built-in defaults, so a policy change only needs a config edit.
-- **Home region**: Always Free compute instances can only be created in the home region, which cannot be changed after sign-up ([Managing Regions](https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/managingregions.htm)). The tool checks at startup that the target region is the home region and refuses to run otherwise.
+- **Home region**: Always Free compute instances can only be created in the home region, which cannot be changed after sign-up ([Managing Regions](https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/managingregions.htm)). The tool checks at startup that the target region is the home region and refuses to run otherwise (with `REQUIRE_HOME_REGION=false` it only warns).
 - **Account type**:
   - On a free account, A1 instances exceeding the free allowance are disabled and then deleted.
   - On a PAYG (Pay As You Go) account, usage above the free allowance **is billed**. Make sure `OCPUS` / `MEMORY_GB` stay within your account's free allowance.
@@ -145,7 +145,7 @@ Based mainly on HTTP status and OCI error code, with the message as a fallback (
 | `LimitExceeded` / `QuotaExceeded` | Allowance exceeded |
 | 5xx with `capacity` in the message | Out of capacity |
 | Other 5xx; 409 `IncorrectState` / `ExternalServerIncorrectState` / `LockConflict` | Transient |
-| Other 400, 401, 403, 404, 409 | Config error |
+| Other 4xx | Config error |
 | `oci.exceptions.RequestException` / `ConnectTimeout`, `ConnectionError`, `TimeoutError` | Network error |
 
 "Out of capacity" is not in the official error table; the actual response is `500 / InternalError / "Out of host capacity."`. If the message format ever changes, it is treated as a transient error and retried with backoff rather than stopping the tool.
@@ -182,7 +182,7 @@ Installed layout:
 - Runs as the dedicated non-root user `oci-claimer` with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, and other hardening; logs go to journald.
 - Config and keys are owned by root and readable by the service group, so the service cannot modify its own configuration.
 - `RestartPreventExitStatus=2 3 4`: only unexpected errors trigger an automatic restart.
-- A dry-run is executed as the service user before installation; installation is aborted if it fails.
+- After the program and config are copied to `/opt` and `/etc`, a dry-run is executed as the service user; if it fails, the unit is not installed or started.
 - Re-running does not overwrite existing files in `/etc`; differences are reported, and `--update-config` overwrites them.
 - `config.env` must use the default `secrets/` paths. Keep secrets such as the Telegram token in `config.env`, not in the unit's `Environment=`.
 - On WSL, first set `systemd=true` under `[boot]` in `/etc/wsl.conf` and restart WSL.
@@ -239,7 +239,7 @@ References:
 python -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs the tests on Python 3.10, 3.12, and 3.14 plus `shellcheck` on every push and pull request. The OCI clients are mocked, so no real API calls are made. Covered: AD rotation, 429 backoff, quota stop, usage check, home region check, the success path, post-launch failures and resume, idempotency when the outcome is unknown, duplicate-launch guards (pending before launch, token expiry, state lock), network recovery, exit codes, config parsing, file permissions, log redaction, and the periodic progress report.
+GitHub Actions runs the tests on Python 3.10, 3.12, and 3.14 plus `shellcheck` on `setup.sh` for pushes to `main` and every pull request. The OCI clients are mocked, so no real API calls are made. Covered: AD rotation, 429 backoff, quota stop, usage check, home region check, the success path, post-launch failures and resume, idempotency when the outcome is unknown, duplicate-launch guards (pending before launch, token expiry, state lock), network recovery, exit codes, config parsing, file permissions, log redaction, and the periodic progress report.
 
 ## Dependencies
 
@@ -256,7 +256,6 @@ GitHub Actions runs the tests on Python 3.10, 3.12, and 3.14 plus `shellcheck` o
 - If writing `state.json` fails right after a successful launch (for example, disk full), the tool exits with code 4 and notifies you; `pending_launch.json` is kept, so the next start resends with the same token and picks up that instance.
 - In resume mode, if the instance has been terminated, the tool keeps exiting with code 4; delete `state.json` manually after checking.
 - Whether assigning a public IP needs an extra `public-ips` permission is not yet verified (it can only be confirmed after a successful launch).
-- File permissions are not checked on Windows; access is governed by the folder's ACL.
 
 ## License
 

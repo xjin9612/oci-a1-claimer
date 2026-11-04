@@ -15,11 +15,12 @@ Group=oci-claimer
 WorkingDirectory=/opt/oci-a1-claimer
 ExecStart=/opt/oci-a1-claimer/.venv/bin/python /opt/oci-a1-claimer/claimer.py
 Environment=CLAIMER_CONFIG=/etc/oci-a1-claimer/config.env
+# 覆寫 config.env 的 STATE_DIR；須與下方 StateDirectory 一致
 Environment=STATE_DIR=/var/lib/oci-a1-claimer
 Environment=PYTHONUNBUFFERED=1
 
-# 結束碼：0 成功、2 設定錯誤、3 額度已滿、4 已建立但後續失敗、130 收到停止訊號
-# 只有非預期錯誤（1）才重啟；2/3/4 重啟沒有意義，4 更不能重啟去重新申請
+# 須與 claimer.py 的 EXIT_* 一致：0 成功、1 非預期錯誤、2 設定錯誤、3 額度已滿、
+# 4 已建立但後續失敗或需人工確認、130 收到停止訊號。只重啟 1；2/3/4 需人工處理，重啟只會重複失敗
 Restart=on-failure
 RestartSec=60
 RestartPreventExitStatus=2 3 4

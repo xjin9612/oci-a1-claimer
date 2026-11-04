@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""oci-a1-claimer：持續申請 OCI Always Free 的 VM.Standard.A1.Flex（ARM）實例。
+"""oci-a1-claimer：持續申請 OCI Always Free 的 VM.Standard.A1.Flex（ARM）實例，成功後寫出結果並退出。
 
-流程：
-  1. 載入 config.env，環境變數可覆寫同名設定。
-  2. 若 STATE_DIR 內已有 state.json（之前已建立過實例）→ 只補做後續步驟，絕不重新申請。
-  3. 檢查現有 A1 用量；「已用 + 本次申請」超過免費額度就直接退出。
-  4. 依序對每個可用域（AD）呼叫 launch_instance；容量不足換下一個 AD，
-     整輪結束後休息 INTERVAL_SECONDS + 隨機 jitter。
-  5. 建立成功 → 立刻寫 state.json → 等 RUNNING → 取公網 IP → 寫 result.json → 通知 → 退出。
-
-結束碼：見下方 EXIT_* 常數，systemd unit 以 RestartPreventExitStatus 避免無意義重啟。
+STATE_DIR 內有 state.json 時只補做建立後步驟，絕不重新申請。
+EXIT_* 須與 deploy/oci-a1-claimer.service 的 RestartPreventExitStatus 一致。
 """
 
 from __future__ import annotations
@@ -45,9 +38,6 @@ try:
 except ImportError:  # pragma: no cover - 只在未安裝時觸發
     sys.exit("找不到 oci 套件，請先執行：pip install -r requirements.txt")
 
-# ---------------------------------------------------------------------------
-# 常數
-# ---------------------------------------------------------------------------
 
 SHAPE = "VM.Standard.A1.Flex"
 
@@ -78,10 +68,6 @@ NETWORK_ERRORS: tuple[type[BaseException], ...] = (
 log = logging.getLogger("oci-a1-claimer")
 
 
-# ---------------------------------------------------------------------------
-# 例外
-# ---------------------------------------------------------------------------
-
 class ConfigError(Exception):
     """設定或權限錯誤，重試無意義。"""
 
@@ -106,16 +92,12 @@ class Interrupted(Exception):
     """收到停止訊號。"""
 
 
-# ---------------------------------------------------------------------------
-# 設定
-# ---------------------------------------------------------------------------
-
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
-    """解析 KEY=VALUE 格式；支援 # 註解、空行、前後引號。"""
+    """接受整行 # 註解、export 前綴與成對引號；不支援行尾註解（# 之後併入值）。"""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
@@ -139,7 +121,7 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 @dataclass
 class Settings:
-    # 必填：規格與免費額度上限刻意不給程式內預設值，一律以 config.env 為準
+    # 必填：規格與免費額度上限刻意不設預設值，政策變動時只需改設定
     subnet_id: str
     ssh_public_key_file: str
     ocpus: float
@@ -243,18 +225,14 @@ def _convert(key: str, raw: str, kind: str):
     raise AssertionError(kind)
 
 
-# 路徑類設定：相對路徑以設定檔所在目錄為基準，避免因啟動目錄不同而找不到 state.json
+# 相對路徑以設定檔所在目錄為基準（無設定檔時以目前目錄），避免因啟動目錄不同而找不到 state.json
 _PATH_ATTRS = ("ssh_public_key_file", "state_dir", "oci_config_file")
-# 必須大於 0 的數值設定
 _POSITIVE_ATTRS = ("ocpus", "memory_gb", "free_ocpu_limit", "free_memory_gb_limit")
 
 
 def load_settings(config_path: Path | None, environ: dict[str, str] | None = None) -> Settings:
-    """合併設定檔與環境變數，並做基本檢查。
-
-    * 環境變數只要「有設定」就優先，即使是空字串；空字串代表使用預設值，
-      因此可用 TG_BOT_TOKEN= 這種寫法關閉設定檔中的值。
-    * 相對路徑以設定檔所在目錄為基準（無設定檔時以目前目錄為基準）。
+    """環境變數只要有設定就優先，即使是空字串；空字串代表使用預設值，
+    因此可用 TG_BOT_TOKEN= 這種寫法關閉設定檔中的值。
     """
     environ = os.environ if environ is None else environ
     file_values: dict[str, str] = {}
@@ -307,18 +285,11 @@ def _attr_of(key: str) -> str:
     raise KeyError(key)
 
 
-# ---------------------------------------------------------------------------
-# 檔案工具
-# ---------------------------------------------------------------------------
-
 def check_file_permissions(path: Path, label: str) -> bool:
-    """檔案若 group 可寫或 other 有任何權限就警告；回傳 True 表示權限 OK。
+    """group 可寫或 other 有任何權限時警告並回傳 False；無法 stat 時不檢查、回傳 True。
 
-    允許 group 唯讀（0640），以支援「root 擁有、服務群組唯讀」的部署方式。
-    只在 POSIX 上檢查；Windows 的 ACL 不在此範圍。
+    允許 0640，以支援「root 擁有、服務群組唯讀」的部署方式。
     """
-    if os.name != "posix":
-        return True
     try:
         mode = path.stat().st_mode & 0o777
     except OSError:
@@ -331,13 +302,11 @@ def check_file_permissions(path: Path, label: str) -> bool:
 
 
 def write_json_atomic(path: Path, data: dict) -> None:
-    """原子寫入 JSON：同目錄暫存檔 → fsync → os.replace，權限 0600。"""
+    """原子替換寫入 JSON，權限 0600。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     try:
-        # Windows（3.13 前）沒有 os.fchmod，權限由目錄 ACL 決定
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
@@ -350,16 +319,15 @@ def write_json_atomic(path: Path, data: dict) -> None:
         except FileNotFoundError:
             pass
         raise
-    if os.name == "posix":
-        # 確保目錄項目也落盤；失敗不影響結果正確性
+    # 確保目錄項目也落盤；失敗不影響結果正確性
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
         try:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def read_json(path: Path) -> dict | None:
@@ -374,7 +342,7 @@ class StateFileError(Exception):
 
 
 def load_state(path: Path) -> dict | None:
-    """讀取 state.json；損毀時不可當成「沒有 state」，否則可能重新申請。"""
+    """不存在回傳 None；損毀或缺 instance_id 時拋 StateFileError，呼叫端不得當成沒有 state。"""
     try:
         state = read_json(path)
     except (OSError, ValueError) as exc:
@@ -389,10 +357,6 @@ def load_state(path: Path) -> dict | None:
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-
-# ---------------------------------------------------------------------------
-# 日誌：遮蔽敏感值
-# ---------------------------------------------------------------------------
 
 class RedactingFormatter(logging.Formatter):
     """在最終輸出字串（含例外 traceback）上遮蔽已知敏感值，例如 Telegram token。
@@ -421,12 +385,8 @@ def setup_logging(level: str, secrets_: list[str] | tuple[str, ...] = ()) -> Non
     logging.getLogger("oci").setLevel(logging.WARNING)
 
 
-# ---------------------------------------------------------------------------
-# 通知
-# ---------------------------------------------------------------------------
-
 class TelegramNotifier:
-    """以標準庫 urllib 發送 Telegram 訊息；失敗只記錄，不影響主流程。"""
+    """token 或 chat_id 未設定時不發送；send 失敗只記錄、回傳 False，不拋例外。"""
 
     def __init__(self, token: str, chat_id: str, timeout: float = 10.0):
         self.token = token
@@ -464,10 +424,6 @@ def telegram_error_description(exc: urllib.error.HTTPError) -> str:
         return ""
 
 
-# ---------------------------------------------------------------------------
-# 錯誤分類
-# ---------------------------------------------------------------------------
-
 class ErrorKind(Enum):
     CAPACITY = "容量不足"
     RATE_LIMIT = "請求過於頻繁（429）"
@@ -484,7 +440,7 @@ _QUOTA_CODES = {"LimitExceeded", "QuotaExceeded"}
 def classify_service_error(exc: ServiceError) -> ErrorKind:
     """以 status + code 為主、訊息字串為輔判斷錯誤類型。
 
-    依據：OCI 官方 API Errors 文件（apierrors.htm）。容量不足不在官方錯誤表內，
+    依據：OCI API Errors（https://docs.oracle.com/en-us/iaas/Content/API/References/apierrors.htm）。容量不足不在官方錯誤表內，
     社群實測回應為 500 / code=InternalError / message="Out of host capacity."，
     因此 5xx 時才以訊息含 "capacity" 作為輔助判斷。
     """
@@ -501,8 +457,7 @@ def classify_service_error(exc: ServiceError) -> ErrorKind:
             return ErrorKind.CAPACITY
         return ErrorKind.TRANSIENT
     if status == 409:
-        if code in _RETRYABLE_409 or code == "InvalidatedRetryToken":
-            # InvalidatedRetryToken：換新 token 再試即可
+        if code in _RETRYABLE_409:
             return ErrorKind.TRANSIENT
         return ErrorKind.CONFIG
     if status == 400 and ("service limit" in message or "quota" in message):
@@ -516,10 +471,6 @@ def classify_service_error(exc: ServiceError) -> ErrorKind:
 def describe_service_error(exc: ServiceError) -> str:
     return f"{exc.status} {exc.code}: {exc.message} (opc-request-id={exc.request_id})"
 
-
-# ---------------------------------------------------------------------------
-# 映像檔挑選
-# ---------------------------------------------------------------------------
 
 def _version_tuple(text: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", text or ""))
@@ -553,10 +504,6 @@ def pick_image(images: list, settings: Settings):
     return max(candidates, key=key)
 
 
-# ---------------------------------------------------------------------------
-# OCI client
-# ---------------------------------------------------------------------------
-
 @dataclass
 class OciClients:
     compute: object
@@ -566,14 +513,13 @@ class OciClients:
     region: str
 
 
-def build_clients(settings: Settings) -> tuple[OciClients, dict]:
-    """建立 OCI client。
+def build_clients(settings: Settings) -> OciClients:
+    """明確指定 retry_strategy，避免行為受環境變數 OCI_SDK_DEFAULT_RETRY_ENABLED 影響：
+    啟動階段的唯讀呼叫用 SDK 的 DEFAULT_RETRY_STRATEGY；launch_instance 與建立後的輪詢
+    在呼叫時改傳 NoneRetryStrategy，由本程式控制退避節奏。
 
-    * 明確指定 retry_strategy，避免行為受環境變數 OCI_SDK_DEFAULT_RETRY_ENABLED 影響。
-      啟動階段的唯讀呼叫用 SDK 的 DEFAULT_RETRY_STRATEGY；launch_instance 與建立後的輪詢
-      在呼叫時改傳 NoneRetryStrategy，由本程式控制退避節奏。
-    * 明確停用斷路器：OCI_SDK_DEFAULT_CIRCUITBREAKER_ENABLED=true 時，連續 5xx 會讓
-      之後的呼叫被擋下，而輪詢容量不足正好是連續 500。
+    明確停用斷路器：OCI_SDK_DEFAULT_CIRCUITBREAKER_ENABLED=true 時，連續 5xx 會讓
+    之後的呼叫被擋下，而輪詢容量不足正好是連續 500。
     """
     config_path = settings.oci_config_file
     check_file_permissions(Path(config_path), "OCI 設定檔")  # 可能含 pass_phrase
@@ -600,17 +546,13 @@ def build_clients(settings: Settings) -> tuple[OciClients, dict]:
     except (ClientError, OSError, ValueError) as exc:
         raise ConfigError(f"OCI 設定或金鑰有問題（{config_path} / {settings.oci_profile}）："
                           f"{type(exc).__name__}: {exc}") from None
-    return clients, cfg
+    return clients
 
 
 def new_retry_token() -> str:
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(32))
 
-
-# ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
 
 class Claimer:
     def __init__(
@@ -642,7 +584,7 @@ class Claimer:
         self.pending_path = Path(settings.state_dir).expanduser() / PENDING_FILE
         self.lock_path = Path(settings.state_dir).expanduser() / LOCK_FILE
         self._rate_limit_streak = 0
-        # 唯讀呼叫的預設時限；None 表示無限重試（正式執行），dry-run 會設定上限
+        # call_with_retry 未指定 deadline 時採用的 self.clock() 時間點；None 表示無限重試，dry-run 會設定
         self.default_deadline: float | None = None
         # 申請統計，供定期回報使用
         self.stats = {"attempts": 0, "capacity": 0, "rate_limited": 0, "transient": 0, "network": 0}
@@ -650,9 +592,8 @@ class Claimer:
         self.started_at = ""
         self.next_heartbeat: float | None = None
 
-    # ---- 共用工具 -------------------------------------------------------
-
     def sleep(self, seconds: float) -> None:
+        """收到停止訊號時拋 Interrupted。"""
         if seconds <= 0:
             return
         if self._sleep_fn is not None:
@@ -678,10 +619,9 @@ class Claimer:
         return delay + self.rng.uniform(0, self.s.jitter_seconds)
 
     def call_with_retry(self, what: str, fn: Callable, *args, deadline: float | None = None, **kwargs):
-        """唯讀呼叫的外層保護：網路錯誤 / 暫時性 / 429 退避重試；設定類錯誤轉成 ConfigError。
+        """唯讀呼叫：網路錯誤、暫時性錯誤、429 退避重試；設定類錯誤轉 ConfigError、額度類轉 QuotaExhausted。
 
-        deadline=None 表示無限重試（啟動階段：網路斷線時等它恢復而不是 crash）；
-        否則超過 deadline（self.clock() 的時間點）就拋 TimeoutError。
+        deadline 為 self.clock() 的時間點，超過拋 TimeoutError；None 時用 default_deadline，兩者皆 None 則無限重試。
         """
         if deadline is None:
             deadline = self.default_deadline
@@ -728,10 +668,8 @@ class Claimer:
                 return items
             page = resp.next_page
 
-    # ---- 啟動前檢查 -----------------------------------------------------
-
     def current_a1_usage(self) -> tuple[float, float, list]:
-        """加總未終止的同 shape 實例。STOPPED 也計入（保守做法）。"""
+        """回傳 (OCPU, 記憶體 GB, 實例)；加總 compartment 與 USAGE_EXTRA_COMPARTMENT_IDS 內未終止的 A1 實例，STOPPED 也計入。"""
         ocpus = mem = 0.0
         found = []
         compartments = [self.compartment_id] + [c for c in self.s.usage_extra_compartment_ids if c != self.compartment_id]
@@ -822,8 +760,6 @@ class Claimer:
         if not re.match(r"^(ssh-|ecdsa-|sk-)", text):
             raise ConfigError(f"{path} 看起來不是 SSH 公鑰（是否誤填成私鑰？）")
         return text
-
-    # ---- 建立實例 -------------------------------------------------------
 
     def launch_spec(self, image_id: str) -> dict:
         """申請內容中會隨時間或設定改變的部分；與 token 一起存進 pending，重送時沿用。"""
@@ -940,10 +876,6 @@ class Claimer:
                 log.warning("[%s] 網路錯誤 %s，%.0f 秒後以同一 token 重送", ad, type(exc).__name__, delay)
                 self.sleep(delay)
 
-    # ---- 建立後步驟 -----------------------------------------------------
-
-    # ---- 建立後步驟 -----------------------------------------------------
-
     def save_pending(self, ad: str, token: str, spec: dict) -> None:
         self._pending_created_at = self.wall_clock()
         write_json_atomic(self.pending_path, {
@@ -988,7 +920,6 @@ class Claimer:
         })
 
     def _poll(self, what: str, fn: Callable, *args, deadline: float, **kwargs):
-        """建立後步驟用的查詢，依 deadline 控制重試。"""
         return self.call_with_retry(what, fn, *args, deadline=deadline, **kwargs).data
 
     def wait_running(self, instance_id: str):
@@ -1013,6 +944,7 @@ class Claimer:
             self.sleep(15)
 
     def get_ips(self, inst) -> tuple[str | None, str | None]:
+        """回傳 (公網, 私有)；ASSIGN_PUBLIC_IP=false 時公網為 None。"""
         deadline = self.clock() + self.s.public_ip_timeout_seconds
         while True:
             atts = self._poll("列出 VNIC 附加", self.c.compute.list_vnic_attachments, inst.compartment_id,
@@ -1030,7 +962,7 @@ class Claimer:
             self.sleep(10)
 
     def finish(self, instance_id: str) -> int:
-        """建立後步驟。任何失敗都轉成 PostLaunchError，絕不回到申請迴圈。"""
+        """除 Interrupted 外，任何失敗都轉成 PostLaunchError；呼叫端不得回到申請迴圈。"""
         try:
             inst = self.wait_running(instance_id)
             public_ip, private_ip = self.get_ips(inst)
@@ -1060,8 +992,6 @@ class Claimer:
             f"OCI 實例已建立\n名稱：{inst.display_name}\n區域：{self.c.region}\n"
             f"AD：{inst.availability_domain}\n公網 IP：{public_ip or '（無）'}\nOCID：{inst.id}")
         return EXIT_OK
-
-    # ---- 主迴圈 ---------------------------------------------------------
 
     def prepare(self, check_usage: bool = True):
         """啟動前檢查；回傳 (ads, image, ssh_key)。dry-run 與正式執行共用。"""
@@ -1143,10 +1073,6 @@ class Claimer:
             log.info("本輪無果，%.0f 秒後再試", delay)
             self.sleep(delay)
 
-    # ---- 定期回報 -------------------------------------------------------
-
-    # ---- 定期回報 -------------------------------------------------------
-
     def start_heartbeat(self, ads: list[str]) -> None:
         """開始輪詢時通知一次，並排定之後的定期回報；用來發現程式已無聲停止（例如主機睡眠）。"""
         self.started_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %z")
@@ -1192,10 +1118,6 @@ def code_is_invalid_token(exc: ServiceError) -> bool:
     return exc.status == 409 and exc.code == "InvalidatedRetryToken"
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="持續申請 OCI Always Free A1.Flex（ARM）實例")
     parser.add_argument("-c", "--config", default=os.environ.get("CLAIMER_CONFIG", "config.env"),
@@ -1217,12 +1139,11 @@ def main(argv: list[str] | None = None) -> int:
         check_file_permissions(config_path, "設定檔")
         configured = bool(settings.tg_bot_token and settings.tg_chat_id)
         if args.dry_run:
-            # dry-run 只做驗證，不發任何通知
             log.info("Telegram 通知：%s（dry-run 不發送）", "已設定" if configured else "未設定")
         else:
             notifier = TelegramNotifier(settings.tg_bot_token, settings.tg_chat_id)
             log.info("Telegram 通知：%s", "啟用" if configured else "未設定")
-        clients, _ = build_clients(settings)
+        clients = build_clients(settings)
         claimer = Claimer(settings, clients, notifier)
 
         def _on_signal(_signum, _frame):
@@ -1230,8 +1151,7 @@ def main(argv: list[str] | None = None) -> int:
             claimer.stop_event.set()
 
         signal.signal(signal.SIGINT, _on_signal)
-        if hasattr(signal, "SIGTERM"):
-            signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGTERM, _on_signal)
 
         return claimer.dry_run() if args.dry_run else claimer.run()
 
