@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <title>oci-a1-claimer</title>
+  <rect width="1280" height="640" fill="#2D1B4E"/>
+  <g transform="translate(884 160) scale(1.25)">
+    <rect x="90" y="138" width="76" height="66" rx="10" fill="#6EE7A8"/>
+    <g fill="#2D1B4E">
+      <rect x="102" y="156" width="40" height="7" rx="3.5"/>
+      <rect x="102" y="179" width="40" height="7" rx="3.5"/>
+      <circle cx="153" cy="159.5" r="4.5"/>
+      <circle cx="153" cy="182.5" r="4.5"/>
+    </g>
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M100 90 L62 152 L96 220 M156 90 L194 152 L160 220" stroke="#2D1B4E" stroke-width="30"/>
+      <path d="M100 90 L62 152 L96 220 M156 90 L194 152 L160 220" stroke="#F2B134" stroke-width="18"/>
+    </g>
+    <g fill="#F2B134">
+      <rect x="121" y="-128" width="14" height="192" rx="4"/>
+      <rect x="78" y="60" width="100" height="30" rx="10"/>
+    </g>
+  </g>
+  <text x="96" y="268" font-family="Segoe UI, Liberation Sans, DejaVu Sans, sans-serif" font-size="96" font-weight="700" fill="#F8F5FF">oci-a1-claimer</text>
+  <text x="100" y="340" font-family="Segoe UI, Liberation Sans, DejaVu Sans, sans-serif" font-size="34" fill="#D9CCF5">Keeps requesting an OCI Always Free A1</text>
+  <text x="100" y="386" font-family="Segoe UI, Liberation Sans, DejaVu Sans, sans-serif" font-size="34" fill="#D9CCF5">instance until capacity frees up</text>
+  <text x="100" y="452" font-family="Microsoft JhengHei, Noto Sans CJK TC, sans-serif" font-size="30" fill="#B8A6E0">持續申請 OCI Always Free A1 執行個體，直到搶到為止</text>
+</svg>
