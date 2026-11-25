@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> | 繁體中文</p>
 
-<p align="center"><a href="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml"><img src="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p align="center"><a href="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml"><img src="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <a href="https://github.com/xjin9612/oci-a1-claimer/releases/latest"><img src="https://img.shields.io/github/v/release/xjin9612/oci-a1-claimer" alt="Release"></a> <a href="LICENSE"><img src="https://img.shields.io/github/license/xjin9612/oci-a1-claimer" alt="License"></a></p>
 
 持續透過 OCI 官方 API 申請 Always Free 的 `VM.Standard.A1.Flex`（ARM）實例，直到成功為止。
 
