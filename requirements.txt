@@ -762,9 +762,9 @@ multidict==7.1.0 \
     # via
     #   aiohttp
     #   yarl
-oci==2.191.0 \
-    --hash=sha256:9831e669a9d07768f96bc5a71f57477ad8c7129bcd757ecf9c9c70fa9dfb61b1 \
-    --hash=sha256:f149bc6e49d5e11a781d1085b222079eb3eefe59732bb1db9409d6b45a873194
+oci==2.192.0 \
+    --hash=sha256:0a2598eb1dce3ee4cf3474a240cdfe5e061a5e2fbc834cd035f30f2cad65c9ef \
+    --hash=sha256:f7bd3df4022ce4485c6b8d5a8e1cc3c9e06b1a12d679b4d1523d1784308abb73
     # via -r requirements.in
 propcache==0.5.4 \
     --hash=sha256:004e685b315646c410771836e72a44f143bbe624f29653a42687815069a303d5 \
