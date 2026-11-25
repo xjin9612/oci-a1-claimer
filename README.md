@@ -6,7 +6,7 @@
 
 <p align="center">English | <a href="README.zh-TW.md">繁體中文</a></p>
 
-<p align="center"><a href="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml"><img src="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml/badge.svg" alt="CI"></a></p>
+<p align="center"><a href="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml"><img src="https://github.com/xjin9612/oci-a1-claimer/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <a href="https://github.com/xjin9612/oci-a1-claimer/releases/latest"><img src="https://img.shields.io/github/v/release/xjin9612/oci-a1-claimer" alt="Release"></a> <a href="LICENSE"><img src="https://img.shields.io/github/license/xjin9612/oci-a1-claimer" alt="License"></a></p>
 
 Keeps requesting an OCI Always Free `VM.Standard.A1.Flex` (ARM) instance through the official OCI API until it succeeds.
 
